@@ -101,6 +101,7 @@ def main():
     parser.add_argument("--out", default="results/schema_check/schema_report.json")
     args = parser.parse_args()
 
+
     from transformers import AutoTokenizer
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
