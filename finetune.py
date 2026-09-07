@@ -226,6 +226,16 @@ def main():
         out_dir = train_dir(root, args.checkpoint_id)
         print(f"[run_root] {args.run_root} -> checkpoint_id '{args.checkpoint_id}' -> {out_dir}")
 
+    # CRITICAL: build_command() reads args.out_dir, not the local out_dir
+    # variable above. Without this line, a --run_root-derived path never
+    # reaches the actual lerobot-train invocation — it launches with
+    # --output_dir=None (the literal, un-derived default), silently
+    # checkpointing somewhere else entirely while this script's own
+    # bookkeeping (refuse_if_exists, finetune_run.json) all reference the
+    # CORRECT runs/<tag>/train/<id>/ path. This exact bug shipped once;
+    # do not remove this line.
+    args.out_dir = str(out_dir)
+
     if not args.resume:
         from run_naming import refuse_if_exists
         refuse_if_exists(out_dir, "Checkpoint/log directory", args.overwrite)
@@ -244,7 +254,14 @@ def main():
 
     # ── Launch ────────────────────────────────────────────────────────────────
     print("[info] Launching lerobot-train …\n")
-    t0   = time.time()
+    started_at_iso = datetime.now().isoformat()   # captured BEFORE the subprocess,
+    t0             = time.time()                   # so "started_at" in the JSON below
+                                                     # actually means what it says —
+                                                     # previously this was captured
+                                                     # AFTER proc.wait(), making every
+                                                     # run's logged start time land
+                                                     # seconds before its finish time
+                                                     # regardless of true duration.
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -279,7 +296,7 @@ def main():
     # ── Write pending run metadata ────────────────────────────────────────────
     out_dir.mkdir(parents=True, exist_ok=True)
     run_meta = {
-        "started_at":               datetime.now().isoformat(),
+        "started_at":               started_at_iso,
         "dataset_dir":               str(dataset_dir),
         "repo_id":                   args.repo_id,
         "out_dir":                   str(out_dir.resolve()),

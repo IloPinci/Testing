@@ -598,6 +598,14 @@ def _save_episode_videos(r, tag, policy_video_dir, witness_video_dir, fps=15):
             np.concatenate(frames, axis=1)
             for frames in zip(*present)
         ]
+        # This mkdir was missing here (present on the witness-video equivalent
+        # below, but not mirrored to this — policy — branch), which meant any
+        # episode reaching this code path crashed on the first attempt to
+        # write into videos/policy/combined/ before that directory ever
+        # existed. Every OTHER per-role directory gets created just above
+        # (line ~591), so this was purely a missed mirror, not an
+        # intentional asymmetry.
+        (policy_video_dir / "combined").mkdir(parents=True, exist_ok=True)
         _write(combined_policy, policy_video_dir / "combined" / f"{tag}.mp4")
 
     # Per-camera witness videos
