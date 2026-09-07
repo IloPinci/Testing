@@ -94,14 +94,12 @@ def build_obs(mode: str, tokenizer, device):
     return obs, absent, pert.label
 
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", default="lerobot/smolvla_base")
     parser.add_argument("--dataset_dir", default="demos/lerobot/")
     parser.add_argument("--out", default="results/schema_check/schema_report.json")
     args = parser.parse_args()
-
 
     from transformers import AutoTokenizer
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
