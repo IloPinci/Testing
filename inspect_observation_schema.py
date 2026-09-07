@@ -94,6 +94,7 @@ def build_obs(mode: str, tokenizer, device):
     return obs, absent, pert.label
 
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", default="lerobot/smolvla_base")
