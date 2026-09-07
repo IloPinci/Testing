@@ -12,9 +12,9 @@ and (critically) whether SmolVLAPolicy.select_action raises, silently
 pads, or silently reorders anything.
 
 Usage:
-    python inspect_observation_schema.py --checkpoint <ckpt> --dataset_dir <dir> --run_root icra-final
+    python inspect_observation_schema.py --checkpoint <ckpt> --dataset_dir <dir>
 
-Output: runs/<run_root>/schema_check.json (or --out path) + printed summary.
+Output: results/schema_check/schema_report.json + printed summary.
 Read the summary before trusting ANY absent_* result in the paper.
 """
 import argparse
@@ -36,7 +36,25 @@ CONDITIONS_TO_CHECK = [
     "absent_all",         # all tensors OMITTED
 ]
 
-DUMMY_IMG   = np.zeros((256, 256, 3), dtype=np.uint8)
+# Per-camera DISTINCT solid colours, not a shared all-zero image. Three
+# reasons this matters:
+#   1. An all-zero image is a no-op under every blackout mode (zeroing an
+#      already-zero image changes nothing), so "none" / "context_only" /
+#      "no_top" previously fed the model byte-for-byte identical tensors —
+#      making it impossible to notice if select_action() wasn't even being
+#      re-invoked per condition (see the policy.reset() note below).
+#   2. Distinct colours let you SEE whether removing a camera key changes
+#      which learned camera-position-embedding a given image ends up
+#      matched with, i.e. whether the model attends to images by NAME
+#      (observation.images.cameraN) or by POSITIONAL SLOT. A crash-free
+#      forward pass alone doesn't rule out the latter, which would be a
+#      silent, much worse failure mode than a crash.
+#   3. It costs nothing — same shape/dtype as before.
+DUMMY_IMG_BY_ROLE = {
+    "camera1": np.full((256, 256, 3), (200,  30,  30), dtype=np.uint8),  # context: red
+    "camera2": np.full((256, 256, 3), ( 30, 200,  30), dtype=np.uint8),  # wrist:   green
+    "camera3": np.full((256, 256, 3), ( 30,  30, 200), dtype=np.uint8),  # top:     blue
+}
 DUMMY_STATE = np.zeros(6, dtype=np.float32)
 
 
@@ -57,9 +75,9 @@ def build_obs(mode: str, tokenizer, device):
 
     absent = {k for k in ["camera1", "camera2", "camera3"] if pert.camera_is_absent(k)}
 
-    ctx_rgb   = None if "camera1" in absent else pert.apply_blackout(DUMMY_IMG, "camera1")
-    wrist_rgb = None if "camera2" in absent else pert.apply_blackout(DUMMY_IMG, "camera2")
-    top_rgb   = None if "camera3" in absent else pert.apply_blackout(DUMMY_IMG, "camera3")
+    ctx_rgb   = None if "camera1" in absent else pert.apply_blackout(DUMMY_IMG_BY_ROLE["camera1"], "camera1")
+    wrist_rgb = None if "camera2" in absent else pert.apply_blackout(DUMMY_IMG_BY_ROLE["camera2"], "camera2")
+    top_rgb   = None if "camera3" in absent else pert.apply_blackout(DUMMY_IMG_BY_ROLE["camera3"], "camera3")
 
     obs = {}
     if ctx_rgb is not None:   obs["observation.images.camera1"] = img_to_tensor(ctx_rgb)
@@ -80,27 +98,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", default="lerobot/smolvla_base")
     parser.add_argument("--dataset_dir", default="demos/lerobot/")
-    parser.add_argument("--out", default=None,
-                        help="Explicit report output path. Either this OR "
-                             "--run_root is required.")
-    parser.add_argument("--run_root", default=None,
-                        help="Short campaign tag, e.g. 'icra-final'. Derives "
-                             "the path as runs/<run_root>/schema_check.json "
-                             "(see run_naming.py). This diagnostic is a "
-                             "one-off check, not per-condition data, so it's "
-                             "fine to overwrite on every run — no guard here.")
+    parser.add_argument("--out", default="results/schema_check/schema_report.json")
     args = parser.parse_args()
-
-    if args.out is None and args.run_root is None:
-        print("[error] Either --out or --run_root is required.")
-        return
-
-    if args.out is not None:
-        out_path = Path(args.out)
-    else:
-        from run_naming import run_root as _run_root
-        out_path = _run_root(args.run_root) / "schema_check.json"
-        print(f"[run_root] {args.run_root} -> {out_path}")
 
     from transformers import AutoTokenizer
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
@@ -116,6 +115,20 @@ def main():
     for mode in CONDITIONS_TO_CHECK:
         entry = {"blackout_mode": mode}
         try:
+            # CRITICAL: reset the policy's internal action queue before
+            # every condition. SmolVLA (like every chunked LeRobot policy —
+            # ACT, Diffusion Policy, etc.) doesn't run a fresh forward pass
+            # on every call to select_action(): it predicts a CHUNK of
+            # future actions once, caches them, and pops one cached action
+            # per call until the queue is empty. Looping over conditions
+            # without resetting means later conditions can silently just
+            # POP a cached action left over from an EARLIER condition's
+            # forward pass — never actually invoking the model on that
+            # condition's observation at all. policy.reset() clears that
+            # queue so every condition below is a genuine, independent
+            # forward pass on ITS OWN obs dict.
+            policy.reset()
+
             obs, absent, label = build_obs(mode, tokenizer, device)
             entry["label"] = label
             entry["absent_camera_keys"] = sorted(absent)
@@ -144,9 +157,9 @@ def main():
         else:
             print(f"    {entry['error_type']}: {entry['error_message']}")
 
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(out_path).write_text(json.dumps(report, indent=2))
-    print(f"\n[ok] Full report written to {out_path}")
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.out).write_text(json.dumps(report, indent=2))
+    print(f"\n[ok] Full report written to {args.out}")
 
     print("\n" + "=" * 70)
     print("WHAT TO LOOK FOR")
@@ -171,12 +184,18 @@ def main():
      needs to say that explicitly rather than claiming it's evidence
      about "reliance on visual modalities."
 
-  3. Compare action_sample across none / no_top / absent_top with the
-     SAME dummy input. If no_top and absent_top produce wildly
-     different actions despite near-identical available information
-     (both have context+wrist available, absent_top just doesn't have a
-     3rd tensor at all), that's your direct evidence for S2's
-     distinction and can be reported as its own small result.
+  3. Compare action_sample across none / no_top / absent_top. Each camera
+     now gets a DISTINCT solid colour (not a shared zero image) and
+     policy.reset() runs before every condition, so these are genuine,
+     independent forward passes -- not cached pops from one earlier
+     condition's action chunk (that was silently the case in an earlier
+     version of this script; if you're diffing against an old
+     schema_report.json, discard it, it isn't comparable). If no_top and
+     absent_top now produce wildly different actions despite near-
+     identical available information (both have context+wrist available,
+     absent_top just doesn't have a 3rd tensor at all), that's your direct
+     evidence for S2's distinction and can be reported as its own small
+     result.
 """)
 
 
