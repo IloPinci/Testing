@@ -67,7 +67,6 @@ from pathlib import Path
 import imageio.v3 as iio
 import numpy as np
 import torch
-from transformers import AutoTokenizer
 
 from scene_params import (
     IMG_RES, language_instruction_for, DEFAULT_CUBE_COLOR, CUBE_COLORS,
@@ -82,6 +81,7 @@ import genesis as gs
 
 try:
     from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
+    from lerobot.policies.factory import make_pre_post_processors
 except ImportError:
     print("[error] lerobot not installed or SmolVLA policy not found.")
     sys.exit(1)
@@ -112,11 +112,31 @@ check_sub_goals                    = _setup.check_sub_goals
 
 class SmolVLAAgent:
     """
-    Thin wrapper around SmolVLAPolicy that handles observation normalisation,
-    tokenisation, and action denormalisation.
+    Thin wrapper around SmolVLAPolicy that delegates ALL observation
+    preprocessing (renaming, batching, newline-terminating the language
+    instruction, tokenising, device placement, state/action normalisation)
+    and action postprocessing (unnormalising, device placement) to the
+    REAL PolicyProcessorPipeline saved alongside the checkpoint
+    (policy_preprocessor.json / policy_postprocessor.json + their
+    .safetensors state files), loaded via make_pre_post_processors(...,
+    pretrained_path=checkpoint).
 
-    State and action statistics are loaded from the dataset's stats.json so
-    that normalisation exactly matches what was used during training.
+    An earlier version of this class hand-reimplemented tokenisation and
+    mean/std normalisation directly from stats.json. That reimplementation
+    had drifted from what training actually used, in two confirmed ways:
+      1. It never applied NewLineTaskProcessorStep, which SmolVLA's own
+         factory (make_smolvla_pre_post_processors) always inserts to
+         ensure the language instruction ends with a newline before
+         tokenisation — every rollout was feeding the model a differently
+         terminated instruction than it was fine-tuned on.
+      2. It tokenised with max_length=64 / padding=True, while training
+         used config.tokenizer_max_length / config.pad_language_to
+         (confirmed 48 / "max_length" for this checkpoint) via
+         TokenizerProcessorStep.
+    Loading the pipeline directly, instead of re-copying its steps here,
+    means this class can no longer drift from training the same way again
+    — if the pipeline's steps change, this class picks the change up
+    automatically instead of silently falling further out of sync.
     """
 
     def __init__(self, checkpoint: str, dataset_dir: str, device: str = "cuda",
@@ -126,60 +146,54 @@ class SmolVLAAgent:
             language_instruction or language_instruction_for(DEFAULT_CUBE_COLOR)
         )
         print(f"[info] Loading SmolVLA checkpoint: {checkpoint}")
-        self.policy    = SmolVLAPolicy.from_pretrained(checkpoint, device=device)
+        self.policy = SmolVLAPolicy.from_pretrained(checkpoint, device=device)
         self.policy.eval()
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+
+        # Load the checkpoint's OWN saved pre/post-processor pipeline rather
+        # than reconstructing it from dataset_stats — this is the exact
+        # pipeline object training produced, including its normalizer's
+        # learned mean/std (from the .safetensors state file), so there is
+        # no separate stats.json to keep in sync by hand any more.
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            policy_cfg=self.policy.config,
+            pretrained_path=checkpoint,
         )
-
-        stats_path = Path(dataset_dir) / "meta" / "stats.json"
-        if not stats_path.exists():
-            raise FileNotFoundError(f"stats.json not found at {stats_path}")
-        with open(stats_path) as f:
-            raw = json.load(f)
-
-        # Load per-joint mean and std for state and action normalisation
-        self.state_mean = np.array(raw["observation.state"]["mean"], dtype=np.float32)
-        self.state_std  = np.array(raw["observation.state"]["std"],  dtype=np.float32)
-        self.act_mean   = np.array(raw["action"]["mean"],            dtype=np.float32)
-        self.act_std    = np.array(raw["action"]["std"],             dtype=np.float32)
-        print("[info] SmolVLA loaded successfully.")
+        # dataset_dir is kept as a constructor arg for CLI/back-compat only;
+        # it is no longer read directly (no more hand-parsed stats.json).
+        self._dataset_dir = dataset_dir
+        print("[info] SmolVLA + real pre/post-processor pipeline loaded successfully.")
 
     def reset(self):
-        """Reset the policy's internal recurrent state between episodes."""
+        """Reset the policy's internal recurrent state (action queue) between episodes."""
         self.policy.reset()
 
     @torch.no_grad()
     def act(self, context_rgb, wrist_rgb, top_rgb, joint_state,
             language_instruction=None, absent_cameras: set[str] | None = None):
         """
-        Compute one action from the current observation.
+        Compute one action from the current observation via the real
+        preprocessor -> policy -> postprocessor chain.
 
         Cameras listed in absent_cameras are omitted from the observation
         dict entirely (tensor not passed), simulating a missing sensor.
         Cameras that are zeroed by a blackout mode still have their tensors
         passed; the policy sees a black image rather than nothing.
 
-        Returns a (6,) float32 array of denormalised joint position targets.
+        Returns a (6,) float32 array of joint position targets.
         """
         instruction    = language_instruction or self._default_instruction
         absent_cameras = absent_cameras or set()
 
         def img_to_tensor(arr):
-            # HWC uint8 → CHW float32 in [0, 1]
+            # HWC uint8 -> CHW float32 in [0, 1]. No batch dim and no
+            # .to(device) here: AddBatchDimensionProcessorStep and
+            # DeviceProcessorStep inside self.preprocessor do both, exactly
+            # as they did when this dataset was collected/trained on.
             t = torch.from_numpy(arr.copy()).float() / 255.0
-            return t.permute(2, 0, 1).unsqueeze(0).to(self.device)
+            return t.permute(2, 0, 1)
 
-        # Normalise joint state to zero mean / unit variance
-        norm_state = (joint_state - self.state_mean) / (self.state_std + 1e-8)
-        state_t    = torch.from_numpy(norm_state).float().unsqueeze(0).to(self.device)
-
-        enc = self.tokenizer(
-            [instruction], return_tensors="pt",
-            padding=True, truncation=True, max_length=64,
-        )
-
-        # Build observation dict, skipping absent cameras
+        # Build the RAW observation dict — un-normalised, un-batched,
+        # un-tokenised. self.preprocessor does all of that.
         obs = {}
         if "camera1" not in absent_cameras and context_rgb is not None:
             obs["observation.images.camera1"] = img_to_tensor(context_rgb)
@@ -187,17 +201,21 @@ class SmolVLAAgent:
             obs["observation.images.camera2"] = img_to_tensor(wrist_rgb)
         if "camera3" not in absent_cameras and top_rgb is not None:
             obs["observation.images.camera3"] = img_to_tensor(top_rgb)
-        obs["observation.state"]                    = state_t
-        obs["observation.language.tokens"]          = enc["input_ids"].to(self.device)
-        obs["observation.language.attention_mask"]  = enc["attention_mask"].bool().to(self.device)
+        obs["observation.state"] = torch.from_numpy(joint_state.copy()).float()
+        # "task" is the raw instruction string — NewLineTaskProcessorStep +
+        # TokenizerProcessorStep (task_key="task") handle newline-termination
+        # and tokenisation, matching training exactly.
+        obs["task"] = instruction
 
-        action_t = self.policy.select_action(obs)
-        # Policy may return (B, T, A); take the first timestep
+        batch    = self.preprocessor(obs)
+        action_t = self.policy.select_action(batch)
+        # Defensive: policy may in principle return (B, T, A); take the
+        # first timestep. In practice select_action() already pops a single
+        # (B, A) timestep off its internal action-chunk queue.
         if action_t.ndim == 3:
             action_t = action_t[:, 0, :]
-        action_norm = action_t.squeeze(0).cpu().numpy()
-        # Denormalise from standardised space back to joint-angle targets
-        return (action_norm * self.act_std + self.act_mean).astype(np.float32)
+        action_t = self.postprocessor(action_t)
+        return action_t.squeeze(0).cpu().numpy().astype(np.float32)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -548,6 +566,26 @@ def run_rollout(
             latch["reached"] = True
         if gd["grasped"]:
             latch["grasped"] = True
+
+        # TEMPORARY DIAGNOSTIC (S-debug): set DEBUG_GRASP=1 to trace the
+        # near/grasped geometry across a rollout. Added to investigate a
+        # confirmed placed_without_reached / lifted_without_reached
+        # violation (stats_analysis.py's internal-consistency check) —
+        # i.e. episodes where the cube was successfully grasped and placed
+        # WITHOUT GraspDetector's "near" latch (jaw-LINK-ORIGIN-to-cube
+        # distance < near_radius=0.08) ever tripping. If dist stays above
+        # 0.08 for the whole episode despite is_closed/is_elevated/
+        # co_moving all being True, that confirms the jaw link's origin is
+        # offset from the actual fingertip contact point by more than the
+        # current near_radius, and near_radius (or the reference link/point
+        # it's measured from) needs to change — not a one-off fluke.
+        # Remove this block once the root cause is confirmed and fixed.
+        if os.environ.get("DEBUG_GRASP"):
+            print(f"    [debug step {step:2d}] dist={gd['dist']:.4f}  "
+                  f"near={gd['near']}  is_closed={gd['is_closed']}  "
+                  f"is_elevated={gd['is_elevated']}  co_moving={gd['co_moving']}  "
+                  f"grasped={gd['grasped']}  "
+                  f"latch_reached={latch['reached']}  latch_grasped={latch['grasped']}")
 
         reached = latch["reached"]
         lifted  = latch["grasped"]
