@@ -528,7 +528,7 @@ def main():
     )
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    xml_path = "/absolute/path/to/so101_new_calib.xml"
+    xml_path   = os.path.join(script_dir, "../so101_arm/so101_new_calib.xml")
 
     # gs.init's seed controls Genesis-internal stochastic elements (if any);
     # kept equal to the dataset-generation seed for a single reproducible
