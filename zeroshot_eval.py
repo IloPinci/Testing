@@ -393,7 +393,7 @@ class GraspDetector:
 
     def __init__(self, table_height, jaw_link_name="moving_jaw_so101_v1",
                  gripper_close_target=GRIPPER_CLOSE_TARGET, gripper_closed_tol=0.05,
-                 near_radius=0.08, elevation_thresh=0.02, window=5, rel_pos_tol=0.01):
+                 near_radius=0.12, elevation_thresh=0.02, window=5, rel_pos_tol=0.01):
         self.table_height         = table_height
         self.jaw_link_name        = jaw_link_name
         self.gripper_close_target = gripper_close_target
@@ -467,7 +467,7 @@ def run_rollout(
     be consumed (or discarded) by the caller before logging to CSV.
     """
     agent.reset()
-    grasp_detector = GraspDetector(table_height=table_height)
+    grasp_detector = GraspDetector(table_height=table_height, near_radius=0.12)
     grasp_detector.reset()
     # Latch flags: once a sub-goal is achieved it stays True for the episode.
     # Keys match exactly what they latch — "reached" latches gd["near"],
