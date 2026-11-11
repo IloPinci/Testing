@@ -140,14 +140,22 @@ class SmolVLAAgent:
     """
 
     def __init__(self, checkpoint: str, dataset_dir: str, device: str = "cuda",
-                 language_instruction: str | None = None):
+             language_instruction: str | None = None,
+             n_action_steps: int | None = None):
         self.device = device
         self._default_instruction = (
             language_instruction or language_instruction_for(DEFAULT_CUBE_COLOR)
         )
         print(f"[info] Loading SmolVLA checkpoint: {checkpoint}")
         self.policy = SmolVLAPolicy.from_pretrained(checkpoint, device=device)
+        if n_action_steps is not None:
+            assert 1 <= n_action_steps <= self.policy.config.chunk_size, (
+                f"n_action_steps ({n_action_steps}) must be in [1, {self.policy.config.chunk_size}]"
+            )
+            self.policy.config.n_action_steps = n_action_steps
         self.policy.eval()
+        print(f"[info] Policy config: chunk_size={self.policy.config.chunk_size}, "
+            f"n_action_steps={self.policy.config.n_action_steps}")
 
         # Load the checkpoint's OWN saved pre/post-processor pipeline rather
         # than reconstructing it from dataset_stats — this is the exact
