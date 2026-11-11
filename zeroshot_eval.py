@@ -465,6 +465,7 @@ def run_rollout(
     scene_perturbation: ScenePerturbation  = NOMINAL_SCENE,
     cube_xy=None,
     target_xy=None,
+    record_videos: bool                    = True,
 ) -> dict:
     """
     Execute one policy rollout and return metrics plus raw video frames.
@@ -518,18 +519,19 @@ def run_rollout(
             top_rgb = perturbation.apply_blackout(top_rgb, "camera3")
 
         # ── Render witness cameras (no perturbation applied) ──────────────────
-        for w_role, w_cam in witness_cams.items():
-            if "wrist" in w_role:
-                w_cam.move_to_attach()
-            w_rgb, _, _, _ = w_cam.render()
-            if step % RECORD_EVERY == 0:
-                wit_vid[w_role].append(w_rgb.copy())
+        if record_videos:
+            for w_role, w_cam in witness_cams.items():
+                if "wrist" in w_role:
+                    w_cam.move_to_attach()
+                w_rgb, _, _, _ = w_cam.render()
+                if step % RECORD_EVERY == 0:
+                    wit_vid[w_role].append(w_rgb.copy())
 
-        # ── Save training video frames at reduced frame rate ──────────────────
-        if step % RECORD_EVERY == 0:
-            if ctx_rgb   is not None: train_vid["context"].append(ctx_rgb.copy())
-            if wrist_rgb is not None: train_vid["wrist"].append(wrist_rgb.copy())
-            if top_rgb   is not None: train_vid["top"].append(top_rgb.copy())
+            # ── Save training video frames at reduced frame rate ──────────────────
+            if step % RECORD_EVERY == 0:
+                if ctx_rgb   is not None: train_vid["context"].append(ctx_rgb.copy())
+                if wrist_rgb is not None: train_vid["wrist"].append(wrist_rgb.copy())
+                if top_rgb   is not None: train_vid["top"].append(top_rgb.copy())
 
         # ── Query policy ──────────────────────────────────────────────────────
         qpos   = so101.get_dofs_position().cpu().numpy()
@@ -603,6 +605,9 @@ def run_rollout(
             break
         step += 1
 
+    lifted  = bool(lifted or placed)
+    reached = bool(reached or lifted or placed)
+
     success = is_success(cube, target_zone, table_height)
     # PSS: 0.2 for reaching, +0.4 for lifting, +1.0 for placing
     pss     = 0.2 * reached + 0.4 * lifted + 1.0 * placed
@@ -644,13 +649,7 @@ def _save_episode_videos(r, tag, policy_video_dir, witness_video_dir, fps=15):
             np.concatenate(frames, axis=1)
             for frames in zip(*present)
         ]
-        # This mkdir was missing here (present on the witness-video equivalent
-        # below, but not mirrored to this — policy — branch), which meant any
-        # episode reaching this code path crashed on the first attempt to
-        # write into videos/policy/combined/ before that directory ever
-        # existed. Every OTHER per-role directory gets created just above
-        # (line ~591), so this was purely a missed mirror, not an
-        # intentional asymmetry.
+
         (policy_video_dir / "combined").mkdir(parents=True, exist_ok=True)
         _write(combined_policy, policy_video_dir / "combined" / f"{tag}.mp4")
 
