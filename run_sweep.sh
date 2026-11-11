@@ -67,6 +67,8 @@ fi
 # analyze_all_results.py; that script derives paths from CONDITION_SPECS
 # itself and doesn't need this file at all.
 CONDITIONS=(
+    "nominal|--blackout_mode none"
+    "wpos-3.0cm|--pos_target wrist --pos_offset -0.03 0 0"
     "wpos+1.5cm|--pos_target wrist --pos_offset 0.015 0 0"
     "wpos+3.0cm|--pos_target wrist --pos_offset 0.03 0 0"
     "wtilt-10|--tilt_target wrist --tilt_deg -10"

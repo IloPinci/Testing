@@ -977,6 +977,13 @@ def main():
     success_video_count = 0
 
     for ep in range(args.n):
+        # Seed flow-matching noise identically for episode `ep` across all conditions
+        ep_seed = args.seed * 100_000 + ep
+        torch.manual_seed(ep_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(ep_seed)
+        
+        
         cube_xy, target_xy = reset_episode(
             scene, so101, cube, target_zone, table_height, rng,
             scene_perturbation=scene_perturbation,
@@ -1008,7 +1015,7 @@ def main():
             tag = f"ep{ep:02d}_fail"
             save_video = True
 
-        if save_video:
+        if save_video and not args.no_videos:
             _save_episode_videos(r, tag, policy_video_dir, witness_video_dir)
 
         # Remove video buffers before appending to records (not CSV-serialisable)
