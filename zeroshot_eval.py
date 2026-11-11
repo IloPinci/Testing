@@ -356,7 +356,7 @@ def reset_episode(
 #  Rollout constants
 # ══════════════════════════════════════════════════════════════════════════════
 
-MAX_STEPS            = 50    # maximum policy steps per episode
+MAX_STEPS            = 60    # maximum policy steps per episode (we allow 6 chunks of 10 steps)
 HOLD_STEPS           = 10    # simulator steps per policy step (action hold duration)
 RECORD_EVERY         = 5     # save a video frame once every N policy steps
 ARM_DOFS             = np.arange(5)
