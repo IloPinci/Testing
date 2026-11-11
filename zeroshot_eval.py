@@ -729,6 +729,8 @@ def build_run_summary(records, args, perturbation, scene_perturbation, csv_path,
         "checkpoint_id":       getattr(args, "checkpoint_id", None) or Path(args.checkpoint).name,
         "train_seed":          getattr(args, "train_seed", None),
         "env_seed":            args.seed,
+        "n_action_steps":      getattr(args, "n_action_steps", None),
+        "max_steps":           MAX_STEPS,
         "matched_eval_set":    matched_eval_set_info,   # None if unmatched (e.g. --cube_pos preset)
         "dataset_dir":         args.dataset_dir,
         "csv_path":            str(csv_path),
@@ -836,6 +838,11 @@ def main():
                              "Ignored for --cube_pos conditions (already "
                              "fixed by construction). --n must not exceed "
                              "the file's episode count.")
+    parser.add_argument("--n_action_steps", type=int, default=10,
+                    help="Number of action steps executed per chunk before replanning "
+                         "(default: 10 for closed-loop; 50 is open-loop).")
+    parser.add_argument("--no_videos", action="store_true",
+                        help="Skip witness camera rendering and video saving for fast sweeps.")
 
     # ── Camera perturbation ───────────────────────────────────────────────────
     parser.add_argument(
@@ -933,6 +940,7 @@ def main():
         dataset_dir=args.dataset_dir,
         device=device,
         language_instruction=scene_perturbation.language_instruction,
+        n_action_steps=args.n_action_steps,
     )
 
     rng     = np.random.default_rng(args.seed)
