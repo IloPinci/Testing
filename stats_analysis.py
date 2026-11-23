@@ -203,9 +203,13 @@ def print_describe(result, label=""):
     rows += [(k, n) for k, n in [("p_reached_raw", "P(reach,raw)"), ("p_grasped_raw", "P(grasp,raw)"),
                                  ("p_success_carry", "TSR carry"), ("p_success_strict", "TSR strict")]
              if k in result]
+
     for key, name in rows:
         d = result[key]
-        lo, hi = m["ci95_bootstrap"]
+        lo, hi = d["ci95"]
+        print(f"  {name:<12} = {d['rate']:.1%}   95% Wilson CI [{lo:.3f}, {hi:.3f}]   (count {d['count']}/{result['n']})")
+    m = result["mean_pss"]
+    lo, hi = m["ci95_bootstrap"]
     print(f"  {'Mean PSS':<12} = {m['value']:.3f}  95% bootstrap CI [{lo:.3f}, {hi:.3f}]")
 
     if "failure_modes" in result:

@@ -487,6 +487,8 @@ class CameraPerturbation:
         valid_targets = {None, "context", "wrist", "top"}
         if self.position_target not in valid_targets:
             raise ValueError(f"position_target must be one of {valid_targets}")
+        if self.tilt_target not in valid_targets:
+            raise ValueError(f"tilt_target must be one of {valid_targets}")
 
     @property
     def label(self) -> str:
@@ -536,6 +538,13 @@ class CameraPerturbation:
         if self.position_target == role:
             return self.position_offset
         return (0.0, 0.0, 0.0)
+
+    
+    def tilt_deg_for(self, role: str) -> float:
+        """Return the tilt angle for the given camera role, or 0."""
+        if self.tilt_target == role:
+            return self.tilt_deg
+        return 0.0
 
 
 # Convenience instance: no camera perturbation applied
