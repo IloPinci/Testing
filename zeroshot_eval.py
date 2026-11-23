@@ -261,6 +261,7 @@ def build_scene(xml_path: str, perturbation: CameraPerturbation = NOMINAL_PERTUR
     """
     gs.init(backend=gs.gpu, seed=0)
     scene = gs.Scene(
+        show_FPS=False, 
         sim_options=gs.options.SimOptions(dt=SIM_DT, substeps=16),
         rigid_options=gs.options.RigidOptions(
             constraint_solver=gs.constraint_solver.Newton,
