@@ -38,6 +38,7 @@ Usage:
 import argparse
 import csv
 import json
+from math import comb
 from pathlib import Path
 
 import numpy as np
@@ -47,18 +48,46 @@ import numpy as np
 #  Loading
 # ══════════════════════════════════════════════════════════════════════════
 
-def load_csv(path):
+_BOOL = {"true": True, "false": False}
+
+
+def _parse(v):
+    if v is None:
+        return None
+    t = v.strip()
+    if t == "":
+        return None
+    lt = t.lower()
+    if lt in _BOOL:
+        return _BOOL[lt]
+    try:
+        return int(t)
+    except ValueError:
+        pass
+    try:
+        return float(t)
+    except ValueError:
+        return t
+
+
+def load_csv(path, metric: str = "success"):
+    """
+    Load one zeroshot.csv. Every column is parsed (bool/int/float/str/None),
+    so protocol-v2 columns (success_strict, failure_mode, t_grasp, ...) are
+    available; v1 CSVs still load. `metric` selects which column is exposed
+    as r["y"] (the outcome analysed by compare()). Rows are sorted by episode
+    so paired comparisons are index-aligned by episode id, not file order.
+    """
     records = []
     with open(path) as f:
         for row in csv.DictReader(f):
-            records.append({
-                "episode": int(row["episode"]),
-                "success": row["success"].strip().lower() == "true",
-                "pss":     float(row["pss"]),
-                "reached": row["reached"].strip().lower() == "true",
-                "lifted":  row["lifted"].strip().lower()  == "true",
-                "placed":  row["placed"].strip().lower()  == "true",
-            })
+            r = {k: _parse(v) for k, v in row.items()}
+            if metric not in r:
+                raise KeyError(f"{path} has no column {metric!r} "
+                               f"(protocol-v1 CSV? use metric='success').")
+            r["y"] = bool(r[metric])
+            records.append(r)
+    records.sort(key=lambda r: r["episode"])
     return records
 
 
@@ -94,6 +123,10 @@ def bootstrap_mean_ci(values, n_boot: int = 10000, alpha: float = 0.05, seed: in
 #  ST2 — decomposed subgoal probabilities + internal consistency check
 # ══════════════════════════════════════════════════════════════════════════
 
+def _prop(values):
+    c, n = int(sum(bool(v) for v in values)), len(values)
+    return {"count": c, "rate": c / n, "ci95": wilson_ci(c, n)}
+
 def decompose(records):
     n = len(records)
     reached = sum(r["reached"] for r in records)
@@ -103,9 +136,19 @@ def decompose(records):
 
     result = {
         "n": n,
+        
+        **({"p_success_strict": _prop([r["success_strict"] for r in records]),
+            "p_success_carry": _prop([r["success_carry"] for r in records]),
+            "p_reached_raw": _prop([r["reached_raw"] for r in records]),
+            "p_grasped_raw": _prop([r["grasped_raw"] for r in records]),
+            "failure_modes": {m: sum(1 for r in records if r["failure_mode"] == m)
+                              for m in dict.fromkeys(r["failure_mode"] for r in records)}}
+           if "success_strict" in records[0] else {}),
+
         "p_reached": {"count": reached, "rate": reached / n, "ci95": wilson_ci(reached, n)},
         "p_lifted":  {"count": lifted,  "rate": lifted  / n, "ci95": wilson_ci(lifted,  n)},
         "p_placed":  {"count": placed,  "rate": placed  / n, "ci95": wilson_ci(placed,  n)},
+        
         "tsr":       {"count": sum(r["success"] for r in records),
                       "rate": sum(r["success"] for r in records) / n,
                       "ci95": wilson_ci(sum(r["success"] for r in records), n)},
@@ -117,10 +160,19 @@ def decompose(records):
     # the pipeline (you cannot place a cube you never lifted, and you
     # cannot lift a cube you never reached). Any violation means the
     # sub-goal latching logic has a bug.
+    raw = "reached_raw" in records[0] and "grasped_raw" in records[0]
+    if raw:
+        # Protocol v2: raw latches, so this check CAN fail and is informative.
+        records_cc = [{"episode": r["episode"], "placed": r.get("success_strict"),
+                       "lifted": r["grasped_raw"], "reached": r["reached_raw"]} for r in records]
+    else:
+        # Protocol v1 CSVs forced placed=>lifted=>reached before writing,
+        # so this branch can never report a violation.
+        records_cc = records
     violations = {"placed_without_lifted": 0, "placed_without_reached": 0,
                   "lifted_without_reached": 0}
     bad_episodes = []
-    for r in records:
+    for r in records_cc:
         v = []
         if r["placed"] and not r["lifted"]:
             violations["placed_without_lifted"] += 1
@@ -135,6 +187,7 @@ def decompose(records):
             bad_episodes.append({"episode": r["episode"], "violations": v})
 
     result["consistency_check"] = {
+        "uses_raw_latches": raw,
         "violations": violations,
         "total_violating_episodes": len(bad_episodes),
         "bad_episodes": bad_episodes[:20],  # cap for readability
@@ -142,19 +195,26 @@ def decompose(records):
     return result
 
 
+
 def print_describe(result, label=""):
     print(f"\n{'='*60}\nDecomposed sub-goal probabilities{': ' + label if label else ''}  (N={result['n']})\n{'='*60}")
-    for key, name in [("p_reached", "P(reached)"), ("p_lifted", "P(lifted)"),
-                       ("p_placed", "P(placed)"), ("tsr", "TSR")]:
+    rows = [("p_reached", "P(reached)"), ("p_lifted", "P(lifted)"),
+            ("p_placed", "P(placed)"), ("tsr", "TSR")]
+    rows += [(k, n) for k, n in [("p_reached_raw", "P(reach,raw)"), ("p_grasped_raw", "P(grasp,raw)"),
+                                 ("p_success_carry", "TSR carry"), ("p_success_strict", "TSR strict")]
+             if k in result]
+    for key, name in rows:
         d = result[key]
-        lo, hi = d["ci95"]
-        print(f"  {name:<12} = {d['rate']:.1%}   95% Wilson CI [{lo:.3f}, {hi:.3f}]   (count {d['count']}/{result['n']})")
-    m = result["mean_pss"]
-    lo, hi = m["ci95_bootstrap"]
+        lo, hi = m["ci95_bootstrap"]
     print(f"  {'Mean PSS':<12} = {m['value']:.3f}  95% bootstrap CI [{lo:.3f}, {hi:.3f}]")
 
+    if "failure_modes" in result:
+        print("  Failure modes: " + ", ".join(f"{k}={v}" for k, v in result["failure_modes"].items()))
     cc = result["consistency_check"]
     print(f"\n  Internal consistency check:")
+    if not cc["uses_raw_latches"]:
+        print("    (v1 CSV: sub-goals were forced monotone before writing — this check "
+              "is uninformative by construction)")
     if cc["total_violating_episodes"] == 0:
         print(f"    OK — no episode violates reached <= lifted <= placed ordering.")
     else:
@@ -209,19 +269,120 @@ def delta_ci_paired(a, b, n_boot=10000, alpha=0.05, seed=0):
     return point, lo, hi
 
 
-def compare(records_a, records_b, paired=False):
+def mcnemar_exact(a, b):
+    """
+    Exact (binomial) McNemar test for paired binary outcomes a_i, b_i.
+    n01 = #(a=1, b=0), n10 = #(a=0, b=1). Two-sided p-value. This is the
+    standard test for "same episodes, two conditions" and is what reviewers
+    expect next to a paired-bootstrap CI.
+    """
+    a = np.asarray(a, dtype=bool)
+    b = np.asarray(b, dtype=bool)
+    assert len(a) == len(b), "McNemar needs index-aligned pairs"
+    n01 = int(np.sum(a & ~b))
+    n10 = int(np.sum(~a & b))
+    m = n01 + n10
+    if m == 0:
+        return {"n01": 0, "n10": 0, "p": 1.0}
+    k = min(n01, n10)
+    p = sum(comb(m, i) for i in range(k + 1)) / 2 ** m
+    return {"n01": n01, "n10": n10, "p": min(1.0, 2 * p)}
+
+
+def holm(pvals):
+    """Holm-Bonferroni adjusted p-values (same order as input). Controls the
+    family-wise error rate across all perturbation-vs-nominal tests."""
+    p = np.asarray(pvals, dtype=float)
+    order = np.argsort(p)
+    m = len(p)
+    adj = np.empty(m)
+    running = 0.0
+    for rank, idx in enumerate(order):
+        running = max(running, (m - rank) * p[idx])
+        adj[idx] = min(1.0, running)
+    return adj.tolist()
+
+
+def did_paired(nom_a, pert_a, nom_b, pert_b, n_boot=10000, alpha=0.05, seed=0):
+    """
+    Paired difference-in-differences: how much MORE does the perturbation
+    hurt under setting B than under setting A (e.g. B = closed loop,
+    A = open loop)?  DiD = (pert_b - nom_b) - (pert_a - nom_a), computed per
+    episode index (all four arrays aligned on the matched eval set) and
+    bootstrapped over episodes. Negative = B is less robust than A.
+    """
+    arrs = [np.asarray(x, dtype=float) for x in (nom_a, pert_a, nom_b, pert_b)]
+    n = len(arrs[0])
+    assert all(len(x) == n for x in arrs), "DiD needs four index-aligned arrays"
+    d = (arrs[3] - arrs[2]) - (arrs[1] - arrs[0])
+    rng = np.random.default_rng(seed)
+    boot = d[rng.integers(0, n, size=(n_boot, n))].mean(axis=1)
+    return float(d.mean()), float(np.percentile(boot, 100 * alpha / 2)), \
+        float(np.percentile(boot, 100 * (1 - alpha / 2)))
+
+
+def cluster_bootstrap_mean(groups, n_boot=10000, alpha=0.05, seed=0):
+    """
+    Two-stage (hierarchical) bootstrap for episodes nested in training seeds:
+    resample checkpoints with replacement, then episodes within each. Use
+    this, not a pooled Wilson CI, once you have >1 training seed — pooling
+    treats 3x100 episodes as 300 independent draws and ignores between-seed
+    variance (usually the larger source of variability in policy learning).
+    groups: list of 1-D arrays (one per checkpoint).
+    """
+    groups = [np.asarray(g, dtype=float) for g in groups]
+    rng = np.random.default_rng(seed)
+    G = len(groups)
+    means = np.empty(n_boot)
+    for i in range(n_boot):
+        picks = rng.integers(0, G, size=G)
+        means[i] = np.mean([groups[j][rng.integers(0, len(groups[j]), len(groups[j]))].mean()
+                            for j in picks])
+    point = float(np.mean([g.mean() for g in groups]))
+    return point, float(np.percentile(means, 100 * alpha / 2)), \
+        float(np.percentile(means, 100 * (1 - alpha / 2)))
+
+
+def power_mcnemar(p_a, p_b, n, rho=0.5, alpha=0.05, n_sim=4000, seed=0):
+    """
+    Simulated power of the exact McNemar test to detect p_a -> p_b with n
+    paired episodes. rho in [0,1] sets how strongly outcomes are coupled
+    across the two conditions (0 = independent, 1 = maximal overlap); the
+    paired design is more powerful the larger rho. Estimate rho from a pilot
+    (e.g. nominal k50 vs nominal k10) rather than guessing.
+    """
+    p11 = p_a * p_b + rho * (min(p_a, p_b) - p_a * p_b)
+    probs = np.array([p11, p_a - p11, p_b - p11, 1 - p_a - p_b + p11])   # 11, 10, 01, 00
+    probs = np.clip(probs, 0, 1); probs /= probs.sum()
+    rng = np.random.default_rng(seed)
+    hits = 0
+    for _ in range(n_sim):
+        c11, c10, c01, c00 = rng.multinomial(n, probs)
+        a = np.r_[np.ones(c11 + c10), np.zeros(c01 + c00)].astype(bool)
+        b = np.r_[np.ones(c11), np.zeros(c10), np.ones(c01), np.zeros(c00)].astype(bool)
+        hits += mcnemar_exact(a, b)["p"] < alpha
+    return hits / n_sim
+
+
+def compare(records_a, records_b, paired=False, metric="success"):
     fn = delta_ci_paired if paired else delta_ci_unpaired
     if paired and len(records_a) != len(records_b):
         raise ValueError(f"--matched requires equal N: a has {len(records_a)}, "
                           f"b has {len(records_b)}")
+    if paired and [r["episode"] for r in records_a] != [r["episode"] for r in records_b]:
+        raise ValueError("paired comparison needs the same episode ids in both runs")
 
-    out = {"paired": paired, "n_a": len(records_a), "n_b": len(records_b)}
-    for key in ["success", "reached", "lifted", "placed"]:
+    out = {"paired": paired, "n_a": len(records_a), "n_b": len(records_b), "metric": metric}
+    for key in [metric, "reached", "lifted", "placed"]:
         a = _binary_array(records_a, key)
         b = _binary_array(records_b, key)
         point, lo, hi = fn(a, b)
-        out[f"delta_{key}"] = {"point": point, "ci95": [lo, hi],
+        name = "success" if key == metric else key
+        out[f"delta_{name}"] = {"point": point, "ci95": [lo, hi],
                                 "significant": not (lo <= 0 <= hi)}
+    if paired:
+        out["delta_success"]["mcnemar"] = mcnemar_exact(
+            _binary_array(records_a, metric), _binary_array(records_b, metric))
 
     pss_a = [r["pss"] for r in records_a]
     pss_b = [r["pss"] for r in records_b]
@@ -241,7 +402,12 @@ def print_compare(out, label_a="A", label_b="B"):
         lo, hi = d["ci95"]
         sig = "  <-- 95% CI excludes 0" if d["significant"] else ""
         print(f"  {name:<20} = {d['point']:+.4f}   95% CI [{lo:+.4f}, {hi:+.4f}]{sig}")
+        if "mcnemar" in d:
+            mc = d["mcnemar"]
+            print(f"  {'':<20}   exact McNemar: n01={mc['n01']} n10={mc['n10']} p={mc['p']:.3g}")
 
+
+# ══════════════════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════════════════
 #  CLI
@@ -262,13 +428,23 @@ def main():
     p_compare.add_argument("--label_a", default="nominal")
     p_compare.add_argument("--label_b", default="perturbed")
     p_compare.add_argument("--matched", action="store_true",
-                           help="Set only if both CSVs were generated with the "
+                                                      help="Set only if both CSVs were generated with the "
                                 "SAME --matched_eval_set file (ST4) — enables "
                                 "the more powerful paired bootstrap.")
+    p_compare.add_argument("--metric", default="success",
+                           help="Outcome column, e.g. success, success_strict, success_carry.")
     p_compare.add_argument("--out", default=None)
 
-    args = parser.parse_args()
+    p_power = sub.add_parser("power", help="Simulated McNemar power for a paired design")
+    p_power.add_argument("--p_a", type=float, required=True, help="e.g. nominal TSR")
+    p_power.add_argument("--p_b", type=float, required=True, help="TSR you want to detect")
+    p_power.add_argument("--rho", type=float, default=0.5)
+    p_power.add_argument("--alpha", type=float, default=0.05,
+                         help="Per-test alpha (divide by #tests for a Bonferroni-safe estimate)")
+    p_power.add_argument("--n", type=int, nargs="+", default=[50, 100, 150, 200, 300])
 
+    args = parser.parse_args()
+    
     if args.cmd == "describe":
         records = load_csv(args.csv)
         result = decompose(records)
@@ -278,13 +454,18 @@ def main():
             print(f"\n[ok] {args.out}")
 
     elif args.cmd == "compare":
-        records_a = load_csv(args.csv_a)
-        records_b = load_csv(args.csv_b)
-        out = compare(records_a, records_b, paired=args.matched)
+        records_a = load_csv(args.csv_a, metric=args.metric)
+        records_b = load_csv(args.csv_b, metric=args.metric)
+        out = compare(records_a, records_b, paired=args.matched, metric=args.metric)
         print_compare(out, args.label_a, args.label_b)
         if args.out:
             Path(args.out).write_text(json.dumps(out, indent=2))
             print(f"\n[ok] {args.out}")
+
+    elif args.cmd == "power":
+        print(f"Power of exact McNemar, p_a={args.p_a} -> p_b={args.p_b}, rho={args.rho}, alpha={args.alpha}")
+        for n in args.n:
+            print(f"  N={n:<5} power={power_mcnemar(args.p_a, args.p_b, n, args.rho, args.alpha):.2f}")
 
 
 if __name__ == "__main__":
