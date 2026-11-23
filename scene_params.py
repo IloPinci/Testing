@@ -5,8 +5,8 @@ Shared constants and helpers for scene construction, color/instruction
 lookups, perturbation-condition logic, and the two perturbation config
 objects used by two_camera_setup.py, oracle_direct.py, and zeroshot_eval.py.
  
-  CameraPerturbation  — blackout mode, camera position shift, tilt angle.
-  ScenePerturbation   — cube color, fixed spawn preset, distractor spheres.
+  CameraPerturbation  - blackout mode, camera position shift, tilt angle.
+  ScenePerturbation   - cube color, fixed spawn preset, distractor spheres.
 """
 
 from __future__ import annotations
@@ -16,10 +16,10 @@ from typing import Literal, Optional, Tuple, List
 import numpy as np
 
 # ══════════════════════════════════════════════════════════════════════════
-#!  Image resolution — single source of truth (training cameras)
+#!  Image resolution - single source of truth (training cameras)
 # ══════════════════════════════════════════════════════════════════════════
-IMG_RES     = (256, 256)    # (H, W)  — TRAINING cameras
-WITNESS_RES = (1280, 720)   # (H, W)  — witness cameras (never in dataset)
+IMG_RES     = (256, 256)    # (H, W)  - TRAINING cameras
+WITNESS_RES = (1280, 720)   # (H, W)  - witness cameras (never in dataset)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -49,15 +49,15 @@ def language_instruction_for(cube_color: str = DEFAULT_CUBE_COLOR) -> str:
 #  cube_position_preset inside ScenePerturbation to select one.
 #
 #  Layout:
-#      "nominal"          — centre of the training distribution (no OOD)
-#      "near_left/right"  — moderate lateral shift
-#      "far_left/right"   — large lateral shift (near IK boundary)
-#      "workspace_edge"   — cube near the far reach of the arm
-#      "target_shift"     — target relocated; cube at nominal centre
-#      "close_to_target"  — cube starts very close to the target zone
+#      "nominal"          - centre of the training distribution (no OOD)
+#      "near_left/right"  - moderate lateral shift
+#      "far_left/right"   - large lateral shift (near IK boundary)
+#      "workspace_edge"   - cube near the far reach of the arm
+#      "target_shift"     - target relocated; cube at nominal centre
+#      "close_to_target"  - cube starts very close to the target zone
 # ══════════════════════════════════════════════════════════════════════════
 CUBE_POSITIONS: dict[str, dict] = {
-    # in-distribution anchor — MUST match the random-sampling centre used by
+    # in-distribution anchor - MUST match the random-sampling centre used by
     # ScenePerturbation.resolve_spawn()'s no-preset branch ((0.24, 0.00), see
     # below) and build_environment()'s hardcoded initial cube pose in
     # two_camera_setup.py. Previously this was (0.25, 0.00), a ~1cm silent
@@ -98,7 +98,7 @@ class SphereConfig:
         World-frame (x, y) centre position. build_environment() places the
         sphere just above the table surface automatically.
     radius : float
-        Sphere radius in metres.  0.02–0.04 m is visually salient but
+        Sphere radius in metres.  0.02-0.04 m is visually salient but
         small enough not to obstruct most grasps.
     color : (R, G, B) floats in [0, 1]
         Surface colour passed to gs.surfaces.Rough.
@@ -116,12 +116,13 @@ class SphereConfig:
     mass_kg:  float               = 0.05     # >0 → dynamic; 0 → fixed
     friction: float               = 1.0
     label:    str                 = "sphere"
+    collision: bool               = True
 
 
 #! Ready-made sphere layouts 
 # Each entry is a list of SphereConfig objects to pass to build_environment().
 SPHERE_PRESETS: dict[str, List[SphereConfig]] = {
-    # No distractors — baseline / nominal
+    # No distractors - baseline / nominal
     "none": [],
 
     # One orange sphere left of the cube path
@@ -160,16 +161,29 @@ SPHERE_PRESETS: dict[str, List[SphereConfig]] = {
                      label="near_target"),
     ],
 
-    # Same colour as the cube — maximum visual confusion
+    # Same colour as the cube - maximum visual confusion
     "color_match": [
         SphereConfig(xy=(0.20,  0.08), radius=0.025, color=(1.0, 0.0, 0.0),
                      label="red_match"),
     ],
+
+    # Visual-only twins (collision=False)
+    "two_flanking_ghost": [
+        SphereConfig(xy=(0.20,  0.09), radius=0.025, color=(0.9, 0.45, 0.0),
+                     label="flank_left_ghost", collision=False),
+        SphereConfig(xy=(0.20, -0.09), radius=0.025, color=(0.6, 0.0,  0.8),
+                     label="flank_right_ghost", collision=False),
+    ],
+    "color_match_ghost": [
+        SphereConfig(xy=(0.20,  0.08), radius=0.025, color=(1.0, 0.0, 0.0),
+                     label="red_match_ghost", collision=False),
+    ],
 }
 
 
+
 # ══════════════════════════════════════════════════════════════════════════
-#  ScenePerturbation — top-level experiment config
+#  ScenePerturbation - top-level experiment config
 #
 #  Bundles the three scene-level perturbation axes so callers only need to
 #  pass one object instead of multiple loose kwargs.
@@ -249,6 +263,18 @@ class ScenePerturbation:
     @property
     def language_instruction(self) -> str:
         return language_instruction_for(self.cube_color)
+
+    def as_dict(self) -> dict:
+        """Structured description, stored in run_summary.json for analysis."""
+        return {
+            "cube_color": self.cube_color,
+            "cube_position_preset": self.cube_position_preset,
+            "spheres": [
+                {"label": s.label, "xy": list(s.xy), "radius": s.radius,
+                 "collision": s.collision, "mass_kg": s.mass_kg}
+                for s in self.spheres
+            ],
+        }
 
     def resolve_spawn(
         self,
@@ -354,51 +380,68 @@ def is_camera_absent(cam_key: str, mode: str) -> bool:
         return role in ("wrist", "context")
     return False
 
-def apply_camera_blackout(
-    frame: np.ndarray, cam_key: str, mode: str = "none"
-) -> np.ndarray:
-    
+def is_camera_zeroed(cam_key: str, mode: str) -> bool:
     """
-    Zero out frame pixels according to the blackout mode.
- 
-    Absent modes are not handled here; call is_camera_absent() first to
-    decide whether to skip rendering altogether.
+    Return True if this camera's pixels are REPLACED (blanked) by the mode,
+    i.e. the rendered image is never seen by the policy. Callers use this to
+    skip rendering entirely (pure speed-up: the policy receives exactly the
+    same blank tensor it would have received after render + blank).
     """
-
     if mode not in BLACKOUT_MODES:
         raise ValueError(f"Unknown camera_blackout_mode: {mode!r}")
-    if mode in ("none", "3-cam"):
-        return frame
-
+    if mode in ("none", "3-cam") or mode.startswith("absent_"):
+        return False
     role = _CAM_ROLE.get(cam_key)
     if mode == "all_black":
-        return np.zeros_like(frame)
-    
-    # Legacy: "3rd_black" zeros the context (third-person) camera
-    if mode == "3rd_black" and role == "context":
-        return np.zeros_like(frame)
-    
-    # Single-camera-only: zero every camera except the named one
-    if mode == "wrist_only" and role != "wrist":
-        return np.zeros_like(frame)
-    if mode == "context_only" and role != "context":
-        return np.zeros_like(frame)
-    if mode == "top_only" and role != "top":
-        return np.zeros_like(frame)
+        return True
+    if mode == "3rd_black":
+        return role == "context"
+    if mode.endswith("_only"):                     # wrist_only / context_only / top_only
+        return role != mode[: -len("_only")]
+    if mode.startswith("no_"):                     # no_top / no_wrist / no_context
+        return role == mode[len("no_"):]
+    return False
 
-    # Two-camera combos: zero out exactly the one named camera
-    if mode == "no_top" and role == "top":
-        return np.zeros_like(frame)
-    if mode == "no_wrist" and role == "wrist":
-        return np.zeros_like(frame)
-    if mode == "no_context" and role == "context":
-        return np.zeros_like(frame)
 
+# How a blanked camera is filled. "black" is the legacy behaviour (all
+# zeros, which SmolVLA maps to -1 after its [0,1]->[-1,1] rescale). "gray"
+# (constant 0.5 -> 0 after rescale) and "noise" (uniform RGB noise) are
+# controls that separate "the information is missing" from "the input is a
+# specific out-of-distribution image".
+BLANK_FILLS = ("black", "gray", "noise")
+
+
+def blank_frame(shape, fill: str = "black",
+                rng: np.random.Generator | None = None) -> np.ndarray:
+    """Return a uint8 HxWx3 blank image for a blanked camera."""
+    if fill == "black":
+        return np.zeros(shape, dtype=np.uint8)
+    if fill == "gray":
+        return np.full(shape, 128, dtype=np.uint8)
+    if fill == "noise":
+        rng = rng if rng is not None else np.random.default_rng()
+        return rng.integers(0, 256, size=shape, dtype=np.uint8)
+    raise ValueError(f"Unknown blank fill {fill!r}; choose from {BLANK_FILLS}")
+
+
+def apply_camera_blackout(
+    frame: np.ndarray, cam_key: str, mode: str = "none",
+    fill: str = "black", rng: np.random.Generator | None = None,
+) -> np.ndarray:
+    """
+    Blank out frame pixels according to the blackout mode.
+
+    Absent modes are not handled here; call is_camera_absent() first to
+    decide whether to skip rendering altogether. With the default
+    fill="black" this is bit-identical to the previous implementation.
+    """
+    if is_camera_zeroed(cam_key, mode):
+        return blank_frame(frame.shape, fill, rng)
     return frame
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#!  CameraPerturbation — unchanged from v1, kept for full backwards compat
+#!  CameraPerturbation - unchanged from v1, kept for full backwards compat
 # ══════════════════════════════════════════════════════════════════════════
 CameraTarget = Literal["context", "wrist", "top"]
 
@@ -431,6 +474,7 @@ class CameraPerturbation:
     position_offset:  Tuple[float, float, float]  = (0.0, 0.0, 0.0)
     tilt_target:      Optional[str]               = None
     tilt_deg:         float                       = 0.0
+    blank_fill:       str                         = "black"   # see BLANK_FILLS
 
     def __post_init__(self):
         if self.blackout_mode not in BLACKOUT_MODES:
@@ -438,11 +482,11 @@ class CameraPerturbation:
                 f"blackout_mode must be one of {BLACKOUT_MODES}, "
                 f"got {self.blackout_mode!r}"
             )
+        if self.blank_fill not in BLANK_FILLS:
+            raise ValueError(f"blank_fill must be one of {BLANK_FILLS}, got {self.blank_fill!r}")
         valid_targets = {None, "context", "wrist", "top"}
         if self.position_target not in valid_targets:
             raise ValueError(f"position_target must be one of {valid_targets}")
-        if self.tilt_target not in valid_targets:
-            raise ValueError(f"tilt_target must be one of {valid_targets}")
 
     @property
     def label(self) -> str:
@@ -455,26 +499,43 @@ class CameraPerturbation:
             parts.append(f"pos_{self.position_target}=({dx:.2f},{dy:.2f},{dz:.2f})")
         if self.tilt_target is not None:
             parts.append(f"tilt_{self.tilt_target}={self.tilt_deg:.1f}deg")
+        if self.blank_fill != "black" and any(
+                is_camera_zeroed(k, self.blackout_mode) for k in _CAM_ROLE):
+            parts.append(f"fill={self.blank_fill}")
         return "_".join(parts) if parts else "nominal"
 
-    def apply_blackout(self, frame: np.ndarray, cam_key: str) -> np.ndarray:
-        return apply_camera_blackout(frame, cam_key, self.blackout_mode)
+    def apply_blackout(self, frame: np.ndarray, cam_key: str,
+                       rng: np.random.Generator | None = None) -> np.ndarray:
+        return apply_camera_blackout(frame, cam_key, self.blackout_mode,
+                                     fill=self.blank_fill, rng=rng)
 
     def camera_is_absent(self, cam_key: str) -> bool:
         """Return True if this camera's tensor should be omitted entirely."""
         return is_camera_absent(cam_key, self.blackout_mode)
+
+    def camera_is_zeroed(self, cam_key: str) -> bool:
+        """True if this camera's pixels are replaced by a blank (render can be skipped)."""
+        return is_camera_zeroed(cam_key, self.blackout_mode)
+
+    def blank_for(self, shape, rng: np.random.Generator | None = None) -> np.ndarray:
+        return blank_frame(shape, self.blank_fill, rng)
+
+    def as_dict(self) -> dict:
+        """Numeric/structured description, stored in run_summary.json for analysis."""
+        return {
+            "blackout_mode": self.blackout_mode,
+            "position_target": self.position_target,
+            "position_offset": list(self.position_offset),
+            "tilt_target": self.tilt_target,
+            "tilt_deg": self.tilt_deg,
+            "blank_fill": self.blank_fill,
+        }
 
     def position_offset_for(self, role: str) -> Tuple[float, float, float]:
         """Return the position offset for the given camera role, or (0,0,0)."""
         if self.position_target == role:
             return self.position_offset
         return (0.0, 0.0, 0.0)
-
-    def tilt_deg_for(self, role: str) -> float:
-        """Return the tilt angle for the given camera role, or 0."""
-        if self.tilt_target == role:
-            return self.tilt_deg
-        return 0.0
 
 
 # Convenience instance: no camera perturbation applied
