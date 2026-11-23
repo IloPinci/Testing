@@ -64,6 +64,7 @@ _SPHERE_SLUGS = {
     "single_left": "sph-1L", "single_right": "sph-1R",
     "two_flanking": "sph-2flank", "high_clutter": "sph-clutter3",
     "near_target": "sph-nearT", "color_match": "sph-colormatch",
+    "two_flanking_ghost": "sph-2flank-ghost", "color_match_ghost": "sph-colormatch-ghost",
 }
 # SPHERE_PRESETS produce SphereConfig objects whose own .label is per-sphere
 # ("flank_left", "flank_right", ...), not the preset name ("two_flanking").
@@ -78,7 +79,21 @@ _SPHERE_LABEL_COMBO_TO_PRESET = {
     ("clutter_a", "clutter_b", "clutter_c"):   "high_clutter",
     ("near_target",):                          "near_target",
     ("red_match",):                            "color_match",
+    ("flank_left_ghost", "flank_right_ghost"): "two_flanking_ghost",
+    ("red_match_ghost",):                      "color_match_ghost",
 }
+
+# Wrist keeps the legacy one-letter prefix ("wpos+3.0cm", "wtilt+10") so old
+# folders still resolve. Context/top use longer prefixes: a one-letter "c"
+# would make a context-camera shift ("cpos+1.5cm") look like a cube-position
+# preset ("cpos-nearL").
+_CAM_PREFIX = {"wrist": "w", "context": "ctx", "top": "top"}
+
+
+def _cm(metres: float) -> str:
+    """3.0 -> '3.0' (legacy one-decimal form), 0.75 -> '0.75' (no rounding to 0.8)."""
+    cm = round(metres * 100, 4)
+    return f"{cm:.1f}" if round(cm, 1) == cm else f"{cm:g}"
 
 
 def _slugify(text: str, max_len: int = 24) -> str:
@@ -91,15 +106,30 @@ def camera_perturbation_slug(perturbation) -> str:
     parts = [_BLACKOUT_SLUGS.get(perturbation.blackout_mode,
                                   _slugify(perturbation.blackout_mode))]
 
+    
     if perturbation.position_target is not None:
         dx, dy, dz = perturbation.position_offset
-        mag  = max(abs(dx), abs(dy), abs(dz))
-        sign = "-" if (dx + dy + dz) < 0 else "+"
-        parts.append(f"{perturbation.position_target[:1]}pos{sign}{mag*100:.1f}cm")
+        nonzero = [(ax, v) for ax, v in zip("xyz", (dx, dy, dz)) if v != 0.0]
+        t = _CAM_PREFIX[perturbation.position_target]
+        if len(nonzero) <= 1 and (not nonzero or nonzero[0][0] == "x"):
+            # Single x-axis offset: keep the legacy slug ("wpos+3.0cm") so
+            # earlier campaigns' folders still resolve.
+            sign = "-" if dx < 0 else "+"
+            parts.append(f"{t}pos{sign}{_cm(abs(dx))}cm")
+        else:
+            # Any y/z or multi-axis offset: encode every axis, so a 3 cm x
+            # shift and a 3 cm y shift can never share a folder.
+            axes = "".join(f"{ax}{'-' if v < 0 else '+'}{_cm(abs(v))}" for ax, v in nonzero)
+            parts.append(f"{t}pos{axes}cm")
 
     if perturbation.tilt_target is not None:
         sign = "+" if perturbation.tilt_deg >= 0 else ""
-        parts.append(f"{perturbation.tilt_target[:1]}tilt{sign}{perturbation.tilt_deg:.0f}")
+        # :g keeps "10" for integers (legacy) but no longer rounds 2.5 -> "2"
+        parts.append(f"{_CAM_PREFIX[perturbation.tilt_target]}tilt{sign}{perturbation.tilt_deg:g}")
+
+    fill = getattr(perturbation, "blank_fill", "black")
+    if fill != "black" and parts[0] != "nominal":
+        parts[0] = f"{parts[0]}-{fill}"
 
     return "_".join(p for p in parts if p and p != "nominal") or "nominal"
 
@@ -172,9 +202,23 @@ def run_root(tag: str, base: str = "runs") -> Path:
         marker.write_text(date.today().isoformat() + "\n")
     return root
 
+def horizon_dir_name(n_action_steps: int) -> str:
+    """Folder name for an execution horizon, e.g. k50 (open loop) / k10."""
+    return f"k{int(n_action_steps)}"
 
-def eval_paths(root: Path, slug: str) -> dict:
-    cond_dir = root / "eval" / slug
+
+def eval_paths(root: Path, slug: str, n_action_steps: int | None = None) -> dict:
+    """
+    Paths for one eval condition. With n_action_steps given, the layout is
+    runs/<tag>/eval/k<K>/<slug>/ so open-loop and closed-loop runs of the
+    same condition live side by side in ONE campaign (same matched set,
+    same code, same checkpoint) instead of in two differently-named roots.
+    Without it, the legacy runs/<tag>/eval/<slug>/ layout is returned.
+    """
+    base = root / "eval"
+    if n_action_steps is not None:
+        base = base / horizon_dir_name(n_action_steps)
+    cond_dir = base / slug
     return {
         "dir":                cond_dir,
         "csv":                cond_dir / "zeroshot.csv",
