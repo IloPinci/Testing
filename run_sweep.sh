@@ -1,180 +1,182 @@
 #!/usr/bin/env bash
-# run_sweep.sh — sequential driver for the Step 4 zeroshot_eval.py sweep.
+# run_sweep.sh — sequential driver for the evaluation campaign (protocol v2).
 #
-# Usage (run from repo root, e.g. /workspace):
-#   export COMMON="--run_root icra-final --checkpoint $CKPT \
-#       --checkpoint_id baseline --dataset_dir $DATA --n 100 \
-#       --matched_eval_set $MATCH"
-#   nohup bash icra/run_sweep.sh > runs/icra-final/sweep_driver.out 2>&1 &
-#   tail -f runs/icra-final/sweep_driver.out
+# Usage (from the directory that contains icra/):
+#   export CKPT=... MATCH=runs/paper-v2/matched_eval_set.json
+#   export COMMON="--run_root paper-v2 --checkpoint $CKPT --checkpoint_id seed0 \
+#       --train_seed 0 --n 100 --matched_eval_set $MATCH"
+#   export HORIZONS="50 10"            # execution horizons (open loop, closed loop)
+#   export CONDITION_SET=core           # core | dose | controls | all
+#   export VIDEO_ARGS="--video_episodes 0-4"   # same 5 initial states in every condition
+#   nohup bash icra/run_sweep.sh > runs/paper-v2/sweep_driver.out 2>&1 &
 #
-# Run this under nohup/tmux/screen. With 16 conditions at ~45 min each this
-# is a ~12 hour job and an SSH disconnect must not kill it.
-#
-# Behavior:
-#   - Runs each condition SEQUENTIALLY. On one GPU there's no benefit to
-#     parallelizing these, and running two Genesis/CUDA processes at once
-#     is a good way to get silently corrupted renders, not just contention.
-#   - NEVER aborts the whole sweep because one condition failed. Every
-#     condition's outcome (OK / ALREADY_DONE / FAILED / SMOKE_FAILED) is
-#     appended to runs/<tag>/sweep_log.csv and the driver moves on.
-#   - For absent_* conditions specifically: runs a throwaway --n 3 smoke
-#     test FIRST, to a scratch path that never touches the real per-
-#     condition output location. If the smoke test crashes, the real
-#     --n 100 run for that condition is skipped entirely (not attempted)
-#     — so a structurally-incompatible condition costs ~1 minute of GPU
-#     time instead of 45.
-#   - Safe to re-run after an interruption (Ctrl-C, SSH drop, OOM). Any
-#     condition whose output already exists gets a fast, expected refusal
-#     from zeroshot_eval.py's own overwrite guard; this script detects
-#     that specific message and logs it as ALREADY_DONE, not FAILED, and
-#     moves on without wasting time re-attempting it.
-#
-# This script deliberately never re-derives condition_slug()/output paths
-# itself — that logic lives in run_naming.py and duplicating it here would
-# be exactly the kind of drift-prone re-implementation already fixed
-# elsewhere in this codebase. It only watches zeroshot_eval.py's own
-# stdout/exit code to decide what happened.
+# What changed vs. v1 and why
+#   * Every condition runs at EVERY horizon in $HORIZONS inside ONE campaign
+#     (same code, checkpoint, matched set) -> outputs runs/<tag>/eval/k<K>/<slug>/.
+#     OL vs CL used to be two separately produced roots, which made it impossible
+#     to rule out code/protocol differences between them.
+#   * --n_action_steps is set here, explicitly, per run. $COMMON must not contain it.
+#   * Conditions are grouped into sets (core / dose-response / controls) so a
+#     paper campaign is a declared list, not whatever happened to be run.
+#   * Videos: the SAME episode indices are recorded in every condition and
+#     horizon, so make_comparison_video.py can put them side by side.
+#   * Everything else (never abort the sweep on one failure, ALREADY_DONE
+#     detection, absent_* smoke tests) is unchanged.
 
 set -uo pipefail   # NOT -e: a failed condition must not stop the sweep
 
 if [ -z "${COMMON:-}" ]; then
-    echo "[fatal] \$COMMON is not set. Export it first, e.g.:"
-    echo '  export COMMON="--run_root icra-final --checkpoint $CKPT --checkpoint_id baseline --dataset_dir $DATA --n 100 --matched_eval_set $MATCH"'
-    exit 1
+    echo "[fatal] \$COMMON is not set (see header)."; exit 1
 fi
-
+if echo "$COMMON" | grep -q -- "--n_action_steps"; then
+    echo "[fatal] Remove --n_action_steps from \$COMMON; set \$HORIZONS instead."; exit 1
+fi
+if ! echo "$COMMON" | grep -q -- "--matched_eval_set"; then
+    echo "[warn] \$COMMON has no --matched_eval_set: runs will NOT be paired across conditions."
+fi
 RUN_ROOT_TAG=$(echo "$COMMON" | grep -oP '(?<=--run_root )\S+' || true)
 if [ -z "$RUN_ROOT_TAG" ]; then
-    echo "[fatal] Could not find --run_root in \$COMMON."
-    echo "        This driver requires --run_root (not --out) in \$COMMON, since"
-    echo "        it needs a stable, tag-derived place to write its own sweep_log.csv"
-    echo "        and per-condition logs alongside your actual eval outputs."
-    exit 1
+    echo "[fatal] \$COMMON must contain --run_root <tag>."; exit 1
 fi
+
+HORIZONS="${HORIZONS:-50 10}"
+CONDITION_SET="${CONDITION_SET:-core}"
+VIDEO_ARGS="${VIDEO_ARGS:---video_episodes 0-4}"
+EVAL="${EVAL_SCRIPT:-icra/zeroshot_eval.py}"
 
 LOG_DIR="runs/${RUN_ROOT_TAG}/sweep_logs"
 SWEEP_LOG="runs/${RUN_ROOT_TAG}/sweep_log.csv"
 mkdir -p "$LOG_DIR"
-if [ ! -f "$SWEEP_LOG" ]; then
-    echo "timestamp,condition,extra_args,status,elapsed_sec,log_file" > "$SWEEP_LOG"
-fi
+[ -f "$SWEEP_LOG" ] || echo "timestamp,condition,horizon,extra_args,status,elapsed_sec,log_file" > "$SWEEP_LOG"
 
-# ── Condition list: "slug|extra args" ────────────────────────────────────
-# The slug here is only a log-filename / sweep_log.csv label for THIS
-# script — it is not guaranteed to be byte-identical to condition_slug()'s
-# own output naming in run_naming.py. Don't use it to guess CSV paths for
-# analyze_all_results.py; that script derives paths from CONDITION_SPECS
-# itself and doesn't need this file at all.
-CONDITIONS=(
+# ── Condition sets: "label|extra args" ──────────────────────────────────────
+CORE=(
     "nominal|--blackout_mode none"
+    # camera pose (wrist)
     "wpos-3.0cm|--pos_target wrist --pos_offset -0.03 0 0"
     "wpos+1.5cm|--pos_target wrist --pos_offset 0.015 0 0"
     "wpos+3.0cm|--pos_target wrist --pos_offset 0.03 0 0"
     "wtilt-10|--tilt_target wrist --tilt_deg -10"
     "wtilt+10|--tilt_target wrist --tilt_deg 10"
+    # object position (out of the +-4 cm training range)
     "cpos-nearL|--cube_pos near_left"
     "cpos-farL|--cube_pos far_left"
+    # camera availability: full 2^3 factorial (all-black completes it)
     "ctx-only|--blackout_mode context_only"
     "wrist-only|--blackout_mode wrist_only"
     "top-only|--blackout_mode top_only"
     "no-top|--blackout_mode no_top"
     "no-wrist|--blackout_mode no_wrist"
     "no-ctx|--blackout_mode no_context"
+    "all-black|--blackout_mode all_black"
+    # token dropped instead of blanked
     "abs-top|--blackout_mode absent_top"
     "abs-w+t|--blackout_mode absent_wrist_top"
+    # distractors, with visual-only twins (physical obstruction vs distraction)
     "sph-2flank|--spheres two_flanking"
+    "sph-2flank-ghost|--spheres two_flanking_ghost"
     "sph-colormatch|--spheres color_match"
+    "sph-colormatch-ghost|--spheres color_match_ghost"
 )
-# Slugs that get a --n 3 smoke test before the real run. Bash 3.2 (macOS
-# default) has no associative arrays, hence the plain space-separated
-# lookup below instead of a proper set/dict.
+# Dose-response: several magnitudes per axis -> fit TSR vs magnitude curves.
+DOSE=(
+    "wpos-1.5cm|--pos_target wrist --pos_offset -0.015 0 0"
+    "wpos-0.75cm|--pos_target wrist --pos_offset -0.0075 0 0"
+    "wpos+0.75cm|--pos_target wrist --pos_offset 0.0075 0 0"
+    "wposy-1.5cm|--pos_target wrist --pos_offset 0 -0.015 0"
+    "wposy+1.5cm|--pos_target wrist --pos_offset 0 0.015 0"
+    "wposz-1.5cm|--pos_target wrist --pos_offset 0 0 -0.015"
+    "wposz+1.5cm|--pos_target wrist --pos_offset 0 0 0.015"
+    "wtilt-2.5|--tilt_target wrist --tilt_deg -2.5"
+    "wtilt+2.5|--tilt_target wrist --tilt_deg 2.5"
+    "wtilt-5|--tilt_target wrist --tilt_deg -5"
+    "wtilt+5|--tilt_target wrist --tilt_deg 5"
+    "wtilt-15|--tilt_target wrist --tilt_deg -15"
+    "wtilt+15|--tilt_target wrist --tilt_deg 15"
+    "ctxpos+1.5cm|--pos_target context --pos_offset 0.015 0 0"
+    "ctxpos+3.0cm|--pos_target context --pos_offset 0.03 0 0"
+    "ctxtilt+5|--tilt_target context --tilt_deg 5"
+    "ctxtilt+10|--tilt_target context --tilt_deg 10"
+    "toppos+3.0cm|--pos_target top --pos_offset 0.03 0 0"
+    "toptilt+10|--tilt_target top --tilt_deg 10"
+)
+# Controls: is a blanked camera harmful because information is missing, or
+# because a black frame is out of distribution? Plus colour / language.
+CONTROLS=(
+    "no-wrist-gray|--blackout_mode no_wrist --blank_fill gray"
+    "no-wrist-noise|--blackout_mode no_wrist --blank_fill noise"
+    "no-top-gray|--blackout_mode no_top --blank_fill gray"
+    "no-ctx-gray|--blackout_mode no_context --blank_fill gray"
+    "cube-blue|--cube_color blue"
+    "cube-yellow|--cube_color yellow"
+)
+
+case "$CONDITION_SET" in
+    core)     CONDITIONS=("${CORE[@]}") ;;
+    dose)     CONDITIONS=("${DOSE[@]}") ;;
+    controls) CONDITIONS=("${CONTROLS[@]}") ;;
+    all)      CONDITIONS=("${CORE[@]}" "${DOSE[@]}" "${CONTROLS[@]}") ;;
+    *) echo "[fatal] CONDITION_SET must be core|dose|controls|all"; exit 1 ;;
+esac
 SMOKE_FIRST=" abs-top abs-w+t "
 
 run_one() {
-    local slug="$1"; shift
+    local label="$1" k="$2"; shift 2
     local extra_args="$*"
-    local log_file="${LOG_DIR}/${slug}.log"
+    local log_file="${LOG_DIR}/k${k}_${label}.log"
     local t0 t1 elapsed status rc
-
     echo ""
-    echo "============================================================"
-    echo "RUNNING: ${slug}   (args: ${extra_args})"
-    echo "============================================================"
-
+    echo "== k=${k}  ${label}   (args: ${extra_args})"
     t0=$(date +%s)
     # shellcheck disable=SC2086
-    python icra/zeroshot_eval.py $COMMON $extra_args > "$log_file" 2>&1
+    python "$EVAL" $COMMON --n_action_steps "$k" $VIDEO_ARGS $extra_args > "$log_file" 2>&1
     rc=$?
-    t1=$(date +%s)
-    elapsed=$((t1 - t0))
-
+    t1=$(date +%s); elapsed=$((t1 - t0))
     if [ $rc -eq 0 ]; then
-        status="OK"
-        echo "  OK  (${elapsed}s)  -> $log_file"
+        status="OK"; echo "   OK  (${elapsed}s)"
     elif grep -q "already exists" "$log_file"; then
-        status="ALREADY_DONE"
-        echo "  = already had data, skipped by zeroshot_eval.py's own overwrite guard  (${elapsed}s)"
+        status="ALREADY_DONE"; echo "   = already done, skipped"
     else
-        status="FAILED"
-        echo "  FAILED (exit $rc, ${elapsed}s) -- see $log_file"
-        echo "  last 25 lines:"
-        tail -25 "$log_file" | sed 's/^/    /'
+        status="FAILED"; echo "   FAILED (exit $rc) -- see $log_file"; tail -15 "$log_file" | sed 's/^/     /'
     fi
-
-    printf '%s,%s,"%s",%s,%s,%s\n' \
-        "$(date -Iseconds)" "$slug" "$extra_args" "$status" "$elapsed" "$log_file" >> "$SWEEP_LOG"
+    printf '%s,%s,%s,"%s",%s,%s,%s\n' "$(date -Iseconds)" "$label" "$k" "$extra_args" \
+        "$status" "$elapsed" "$log_file" >> "$SWEEP_LOG"
 }
 
-smoke_test_absent() {
-    local slug="$1"; shift
+smoke_test() {
+    local label="$1" k="$2"; shift 2
     local extra_args="$*"
-    local smoke_out="${LOG_DIR}/${slug}_smoke.csv"
-    local smoke_log="${LOG_DIR}/${slug}_smoke.log"
-    local rc
-
-    echo "  ... smoke-testing ${slug} with --n 3 first (scratch output, never touches the real run's path)"
+    local smoke_log="${LOG_DIR}/k${k}_${label}_smoke.log"
     # shellcheck disable=SC2086
-    python icra/zeroshot_eval.py $COMMON $extra_args \
-        --n 3 --out "$smoke_out" --overwrite > "$smoke_log" 2>&1
-    rc=$?
-    if [ $rc -ne 0 ]; then
-        echo "  SMOKE TEST FAILED for ${slug} -- skipping the full --n run entirely."
-        echo "  See $smoke_log for the crash. This condition likely needs the S2"
-        echo "  investigation (inspect_observation_schema.py) revisited before it can"
-        echo "  run at all -- do not just retry it as-is."
-        printf '%s,%s,"%s",%s,%s,%s\n' \
-            "$(date -Iseconds)" "$slug" "$extra_args" "SMOKE_FAILED" "0" "$smoke_log" >> "$SWEEP_LOG"
+    python "$EVAL" $COMMON --n_action_steps "$k" $extra_args --n 3 --video_episodes none \
+        --out "${LOG_DIR}/k${k}_${label}_smoke.csv" --overwrite > "$smoke_log" 2>&1
+    if [ $? -ne 0 ]; then
+        echo "   SMOKE TEST FAILED for ${label} (k=${k}) -- skipping. See $smoke_log"
+        printf '%s,%s,%s,"%s",%s,%s,%s\n' "$(date -Iseconds)" "$label" "$k" "$extra_args" \
+            "SMOKE_FAILED" "0" "$smoke_log" >> "$SWEEP_LOG"
         return 1
     fi
-    echo "  smoke test passed"
     return 0
 }
 
 for entry in "${CONDITIONS[@]}"; do
-    slug="${entry%%|*}"
+    label="${entry%%|*}"
     extra_args="${entry#*|}"
-
-    if [[ "$SMOKE_FIRST" == *" ${slug} "* ]]; then
-        if smoke_test_absent "$slug" "$extra_args"; then
-            run_one "$slug" $extra_args
+    for k in $HORIZONS; do
+        if [[ "$SMOKE_FIRST" == *" ${label} "* ]]; then
+            smoke_test "$label" "$k" $extra_args && run_one "$label" "$k" $extra_args
+        else
+            run_one "$label" "$k" $extra_args
         fi
-    else
-        run_one "$slug" $extra_args
-    fi
+    done
 done
 
 echo ""
-echo "============================================================"
-echo "Sweep finished. Summary (runs/${RUN_ROOT_TAG}/sweep_log.csv):"
-echo "============================================================"
+echo "Sweep finished. runs/${RUN_ROOT_TAG}/sweep_log.csv:"
 column -s, -t "$SWEEP_LOG" 2>/dev/null || cat "$SWEEP_LOG"
-
 FAILED_COUNT=$(grep -c ',FAILED,\|,SMOKE_FAILED,' "$SWEEP_LOG" || true)
 if [ "${FAILED_COUNT:-0}" -gt 0 ]; then
-    echo ""
-    echo "[warn] ${FAILED_COUNT} condition(s) failed or were skipped due to a smoke-test failure."
-    echo "       Do NOT run analyze_all_results.py yet -- check sweep_log.csv and the"
-    echo "       individual logs in runs/${RUN_ROOT_TAG}/sweep_logs/ before treating"
-    echo "       this campaign as complete."
+    echo "[warn] ${FAILED_COUNT} run(s) failed -- inspect logs before analysis."
+else
+    echo "Next: python icra/analyze_paper.py --run_root runs/${RUN_ROOT_TAG}"
 fi
