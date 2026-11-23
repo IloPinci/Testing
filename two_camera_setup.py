@@ -87,7 +87,7 @@ def build_environment(
     surface_thickness = 0.05
     leg_thickness     = 0.05
 
-    # ── Tabletop ──────────────────────────────────────────────────────────────
+    #   Tabletop                                
     scene.add_entity(
         gs.morphs.Box(
             size=(table_width, table_depth, surface_thickness),
@@ -97,7 +97,7 @@ def build_environment(
         material=gs.materials.Rigid(friction=0.01, coup_friction=0.1, coup_softness=0.001),
     )
 
-    # ── Table legs (four corners) ─────────────────────────────────────────────
+    #   Table legs (four corners)                        
     for x in [-table_width / 2 + leg_thickness / 2, table_width / 2 - leg_thickness / 2]:
         for y in [-table_depth / 2 + leg_thickness / 2, table_depth / 2 - leg_thickness / 2]:
             scene.add_entity(
@@ -108,7 +108,7 @@ def build_environment(
                 )
             )
 
-    # ── Cube (colour-parameterised) ───────────────────────────────────────────
+    #   Cube (colour-parameterised)                       
     # High friction values prevent the cube from sliding during grasping
     cube = scene.add_entity(
         gs.morphs.Box(
@@ -124,7 +124,7 @@ def build_environment(
         surface=gs.surfaces.Rough(color=cube_rgb),
     )
 
-    # ── Target zone (visual marker only — no collision) ───────────────────────
+    #Target zone (visual marker only — no collision)             
     target_zone = scene.add_entity(
         gs.morphs.Cylinder(
             radius=0.05,
@@ -136,16 +136,20 @@ def build_environment(
         surface=gs.surfaces.Rough(color=(0.0, 1.0, 0.0)),
     )
 
-    # ── Distractor spheres ────────────────────────────────────────────────────
+    # Distractor spheres 
     sphere_entities: list = []
     for cfg in spheres:
         z        = table_height + cfg.radius   # rest on the table surface
-        is_fixed = (cfg.mass_kg <= 0.0)
+        collides = getattr(cfg, "collision", True)
+        # A ghost (non-colliding) sphere must be fixed, otherwise it would
+        # fall through the table under gravity.
+        is_fixed = (cfg.mass_kg <= 0.0) or not collides
         entity   = scene.add_entity(
             gs.morphs.Sphere(
                 radius=cfg.radius,
                 pos=(cfg.xy[0], cfg.xy[1], z),
                 fixed=is_fixed,
+                collision=collides,
             ),
             material=gs.materials.Rigid(
                 # Back-calculate density from mass and volume so Genesis gets
@@ -159,7 +163,7 @@ def build_environment(
         sphere_entities.append(entity)
         print(f"[scene] Added sphere '{cfg.label}' "
               f"at ({cfg.xy[0]:.3f}, {cfg.xy[1]:.3f}, {z:.3f})  "
-              f"r={cfg.radius}  fixed={is_fixed}")
+              f"r={cfg.radius}  fixed={is_fixed}  collision={collides}")
 
     return cube, target_zone, sphere_entities
 
@@ -210,7 +214,7 @@ def attach_cameras(
     must be moved to its attach position via cam.move_to_attach() before
     each render call.
     """
-    # ── Context camera ────────────────────────────────────────────────────────
+    #   Context camera                             
     ctx_pos_nom, ctx_look_nom = _context_nominal(table_height)
 
     # Perturbation offset takes priority over the manual context_offset kwarg
@@ -227,7 +231,7 @@ def attach_cameras(
         res=IMG_RES, pos=tuple(ctx_pos), lookat=tuple(ctx_lookat), fov=60, GUI=False,
     )
 
-    # ── Top camera ────────────────────────────────────────────────────────────
+    #   Top camera                               
     top_pos_nom, top_look_nom = _top_nominal(table_height)
     top_offset = np.array(perturbation.position_offset_for("top"), dtype=float)
     top_pos    = top_pos_nom + top_offset
@@ -238,7 +242,7 @@ def attach_cameras(
         res=IMG_RES, pos=tuple(top_pos), lookat=tuple(top_lookat), fov=65, GUI=False,
     )
 
-    # ── Wrist camera (attached to gripper link) ────────────────────────────────
+    #   Wrist camera (attached to gripper link)                 
     # The camera is added at an arbitrary world position; the attach() call below
     # fixes it relative to the gripper_link frame
     wrist_cam = scene.add_camera(
@@ -362,11 +366,16 @@ def _rotate_4x4_z(mat: np.ndarray, deg: float) -> np.ndarray:
 
 def is_success(cube, target_zone, table_height, radius=0.05, min_height=0.005):
     """
-    Return True if the cube is resting on the target zone.
+    LEGACY "carry" criterion (kept unchanged for the oracle and for
+    comparability with earlier runs).
 
-    The cube must be within `radius` of the target centre in XY,
-    above the table by at least `min_height`, and not airborne
-    (i.e. not more than 5 cm above the table — the gripper has released it).
+    True if the cube centre is within `radius` of the target centre in XY
+    and its centre is below table_height + 5 cm. NOTE what this does NOT
+    check: it does not require the gripper to have released the cube, nor
+    the cube to be at rest — a cube still held 3 cm above the pad passes.
+    (`min_height` is vacuous: a resting cube's centre is already 1.5 cm up.)
+    zeroshot_eval.py reports this as `success_carry` and uses the stricter
+    episode_metrics.strict_success() as the primary `success_strict`.
     """
     cube_pos    = cube.get_pos()
     target_pos  = target_zone.get_pos()
