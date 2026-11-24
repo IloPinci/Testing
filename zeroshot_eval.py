@@ -916,6 +916,34 @@ def main(argv=None):
     print("─" * 60)
     print(f"[ok] {out_csv}  (N={n}, success = {args.success_metric})")
 
+# in case a process is stuck we don't want to block the whole sweep, so force exit after a grace period
+def _exit_watchdog(code: int, seconds: float):
+    """
+    Genesis caches compiled kernels in an exit hook, which can hang on a
+    headless machine. All results are already on disk when this runs, so give
+    the hook `seconds` to finish, then force the process to exit. Otherwise one
+    stuck process would block the whole sweep.
+    """
+    import threading
+
+    def _force():
+        print(f"[warn] Genesis did not exit within {seconds:.0f}s after the results were "
+              f"saved; forcing exit (results are complete).", flush=True)
+        os._exit(code)
+
+    t = threading.Timer(seconds, _force)
+    t.daemon = True
+    t.start()
+
 
 if __name__ == "__main__":
-    main()
+    _grace = float(os.environ.get("GENESIS_EXIT_TIMEOUT", "300"))
+    try:
+        main()
+    except SystemExit as e:
+        _exit_watchdog(e.code if isinstance(e.code, int) else (0 if e.code is None else 1), _grace)
+        raise
+    except BaseException:
+        _exit_watchdog(1, _grace)
+        raise
+    _exit_watchdog(0, _grace)
