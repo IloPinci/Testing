@@ -161,6 +161,63 @@ def build_command(args, dataset_dir: Path) -> list[str]:
     return cmd
 
 
+def _sha256_tree(root: Path) -> dict:
+    """Fingerprint of every file under a dataset dir (paths + contents)."""
+    import hashlib
+    h, n, size = hashlib.sha256(), 0, 0
+    for f in sorted(p for p in root.rglob("*") if p.is_file()):
+        h.update(str(f.relative_to(root)).encode() + b"\0")
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        n += 1; size += f.stat().st_size
+    return {"sha256": h.hexdigest()[:16], "n_files": n, "bytes": size}
+
+
+def collect_train_provenance(dataset_dir: Path) -> dict:
+    """
+    What produced this checkpoint: code commit, library versions (and the
+    lerobot source commit for an editable install), GPU, dataset fingerprint.
+    Deliberately does NOT import torch/lerobot or touch CUDA here: a CUDA
+    context in this parent process would hold GPU memory for the whole run.
+    """
+    import importlib.metadata as md
+    import importlib.util
+    import socket
+
+    def _run(cmd, cwd=None):
+        try:
+            return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
+                                  timeout=30).stdout.strip() or None
+        except Exception:
+            return None
+
+    def _ver(name):
+        try:
+            return md.version(name)
+        except Exception:
+            return None
+
+    here = Path(__file__).resolve().parent
+    spec = importlib.util.find_spec("lerobot")
+    lerobot_dir = Path(spec.origin).resolve().parent if spec and spec.origin else None
+    return {
+        "git_commit": _run(["git", "rev-parse", "HEAD"], cwd=here),
+        "git_dirty": bool(_run(["git", "status", "--porcelain"], cwd=here)),
+        "versions": {"python": sys.version.split()[0], "torch": _ver("torch"),
+                     "lerobot": _ver("lerobot"), "transformers": _ver("transformers")},
+        "lerobot_source": {
+            "path": str(lerobot_dir) if lerobot_dir else None,
+            "git_commit": _run(["git", "rev-parse", "HEAD"], cwd=lerobot_dir) if lerobot_dir else None,
+            "git_dirty": bool(_run(["git", "status", "--porcelain"], cwd=lerobot_dir)) if lerobot_dir else None,
+        },
+        "gpu": _run(["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"]),
+        "hostname": socket.gethostname(),
+        "argv": sys.argv,
+        "dataset_fingerprint": _sha256_tree(dataset_dir),
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Main
 # ══════════════════════════════════════════════════════════════════════════════
@@ -243,6 +300,13 @@ def main():
     # ── Validate ──────────────────────────────────────────────────────────────
     info = validate_dataset(dataset_dir)
     generation_manifest = read_generation_manifest(dataset_dir)
+    provenance = collect_train_provenance(dataset_dir)
+    print(f"[provenance] commit={provenance['git_commit']} dirty={provenance['git_dirty']} "
+          f"lerobot={provenance['versions']['lerobot']}@{provenance['lerobot_source']['git_commit']} "
+          f"dataset_sha256={provenance['dataset_fingerprint']['sha256']}")
+    if provenance["git_dirty"]:
+        print("[warn] icra/ has uncommitted changes: this checkpoint's code state "
+              "cannot be reproduced from a commit.")
 
     # ── Build command ─────────────────────────────────────────────────────────
     cmd = build_command(args, dataset_dir)
@@ -317,6 +381,7 @@ def main():
         "finished_at":               None,
         "return_code":               None,
         "last_checkpoint":           None,
+        **provenance,
     }
 
 
