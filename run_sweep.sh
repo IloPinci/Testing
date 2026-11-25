@@ -72,6 +72,12 @@ CORE=(
     # token dropped instead of blanked
     "abs-top|--blackout_mode absent_top"
     "abs-w+t|--blackout_mode absent_wrist_top"
+    "abs-ctx|--blackout_mode absent_context"      # remaining cameras shift up one slot
+    "abs-wrist|--blackout_mode absent_wrist"      # top camera moves into the wrist slot
+    # all cameras present, two views exchanged between input slots
+    "swap-wt|--camera_slots swap_wrist_top"
+    "swap-cw|--camera_slots swap_context_wrist"
+    "swap-ct|--camera_slots swap_context_top"
     # distractors, with visual-only twins (physical obstruction vs distraction)
     "sph-2flank|--spheres two_flanking"
     "sph-2flank-ghost|--spheres two_flanking_ghost"
@@ -118,7 +124,7 @@ case "$CONDITION_SET" in
     all)      CONDITIONS=("${CORE[@]}" "${DOSE[@]}" "${CONTROLS[@]}") ;;
     *) echo "[fatal] CONDITION_SET must be core|dose|controls|all"; exit 1 ;;
 esac
-SMOKE_FIRST=" abs-top abs-w+t "
+SMOKE_FIRST=" abs-top abs-w+t abs-ctx abs-wrist "
 
 run_one() {
     local label="$1" k="$2"; shift 2

@@ -53,11 +53,11 @@ from episode_metrics import FAILURE_MODES  # noqa: E402
 # Settings that must be identical for two runs to be compared.
 MUST_MATCH = ("protocol_version", "outcome_code_hash", "max_steps", "metric_config",
               "backend", "env_seed", "total_episodes")
-FAMILY_ORDER = ["nominal", "camera availability", "token dropped", "camera pose",
+FAMILY_ORDER = ["nominal", "camera availability", "token dropped", "slot routing", "camera pose",
                 "object position", "distractors", "appearance", "other"]
-FAMILY_COLORS = {"nominal": "#444444", "camera availability": "#1f77b4", "token dropped": "#17becf",
-                 "camera pose": "#d62728", "object position": "#9467bd", "distractors": "#2ca02c",
-                 "appearance": "#ff7f0e", "other": "#7f7f7f"}
+FAMILY_COLORS = {"nominal": "#444444", "camera availability": "#1f77b4", "token dropped": "#17becf", 
+                 "slot routing": "#8c564b", "camera pose": "#d62728", "object position": "#9467bd", 
+                 "distractors": "#2ca02c", "appearance": "#ff7f0e", "other": "#7f7f7f"}
 MODE_COLORS = {"success": "#2ca02c", "over_target_not_released": "#98df8a",
                "grasped_not_delivered": "#ffbb78", "reached_not_grasped": "#ff7f0e",
                "never_reached": "#d62728"}
@@ -68,6 +68,8 @@ def family(slug: str) -> str:
         return "nominal"
     if slug.startswith("abs-"):
         return "token dropped"
+    if slug.startswith("swap-"):
+        return "slot routing"
     if any(slug.startswith(p) for p in ("ctx-only", "wrist-only", "top-only", "no-", "all-black",
                                          "ctx-black")):
         return "appearance" if slug.endswith(("-gray", "-noise")) else "camera availability"
