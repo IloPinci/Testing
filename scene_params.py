@@ -364,6 +364,19 @@ BLACKOUT_MODES = {
 # Maps SmolVLA camera key to human-readable role name
 _CAM_ROLE = {"camera1": "context", "camera2": "wrist", "camera3": "top"}
 
+_ROLE_KEY = {v: k for k, v in _CAM_ROLE.items()}
+
+# Input-slot routing: all three cameras are rendered (and perturbed) as usual,
+# then two of them are fed into each other's policy input slot. Information is
+# complete; only WHICH slot carries WHICH view changes. Isolates "the model
+# relies on slot order" from "information is missing" (absent_* modes).
+CAMERA_SLOT_SWAPS = {
+    "none":               None,
+    "swap_wrist_top":     ("wrist", "top"),
+    "swap_context_wrist": ("context", "wrist"),
+    "swap_context_top":   ("context", "top"),
+}
+
 def is_camera_absent(cam_key: str, mode: str) -> bool:
     """Return True if this camera's tensor should be omitted entirely."""
     role = _CAM_ROLE.get(cam_key)
@@ -475,8 +488,15 @@ class CameraPerturbation:
     tilt_target:      Optional[str]               = None
     tilt_deg:         float                       = 0.0
     blank_fill:       str                         = "black"   # see BLANK_FILLS
+    camera_slots:     str                         = "none"    # see CAMERA_SLOT_SWAPS
 
     def __post_init__(self):
+        if self.camera_slots not in CAMERA_SLOT_SWAPS:
+            raise ValueError(f"camera_slots must be one of {list(CAMERA_SLOT_SWAPS)}, "
+                             f"got {self.camera_slots!r}")
+        if self.camera_slots != "none" and self.blackout_mode.startswith("absent_"):
+            raise ValueError("camera_slots cannot be combined with absent_* modes "
+                             "(the dropped token already shifts the slots)")
         if self.blackout_mode not in BLACKOUT_MODES:
             raise ValueError(
                 f"blackout_mode must be one of {BLACKOUT_MODES}, "
@@ -504,7 +524,17 @@ class CameraPerturbation:
         if self.blank_fill != "black" and any(
                 is_camera_zeroed(k, self.blackout_mode) for k in _CAM_ROLE):
             parts.append(f"fill={self.blank_fill}")
+        if self.camera_slots != "none":
+            parts.append(f"slots={self.camera_slots}")
         return "_".join(parts) if parts else "nominal"
+
+    def slot_source(self, cam_key: str) -> str:
+        """Key of the PHYSICAL camera whose image is fed into input slot `cam_key`."""
+        pair = CAMERA_SLOT_SWAPS[self.camera_slots]
+        if pair is None:
+            return cam_key
+        a, b = (_ROLE_KEY[r] for r in pair)
+        return b if cam_key == a else a if cam_key == b else cam_key
 
     def apply_blackout(self, frame: np.ndarray, cam_key: str,
                        rng: np.random.Generator | None = None) -> np.ndarray:
@@ -531,6 +561,7 @@ class CameraPerturbation:
             "tilt_target": self.tilt_target,
             "tilt_deg": self.tilt_deg,
             "blank_fill": self.blank_fill,
+            "camera_slots": self.camera_slots,
         }
 
     def position_offset_for(self, role: str) -> Tuple[float, float, float]:
