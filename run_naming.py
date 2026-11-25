@@ -89,6 +89,10 @@ _SPHERE_LABEL_COMBO_TO_PRESET = {
 # preset ("cpos-nearL").
 _CAM_PREFIX = {"wrist": "w", "context": "ctx", "top": "top"}
 
+# Input-slot swaps (all cameras present, two views exchanged).
+_SLOT_SLUGS = {"swap_wrist_top": "swap-wt", "swap_context_wrist": "swap-cw",
+               "swap_context_top": "swap-ct"}
+
 
 def _cm(metres: float) -> str:
     """3.0 -> '3.0' (legacy one-decimal form), 0.75 -> '0.75' (no rounding to 0.8)."""
@@ -128,8 +132,13 @@ def camera_perturbation_slug(perturbation) -> str:
         parts.append(f"{_CAM_PREFIX[perturbation.tilt_target]}tilt{sign}{perturbation.tilt_deg:g}")
 
     fill = getattr(perturbation, "blank_fill", "black")
+    slots = getattr(perturbation, "camera_slots", "none")
+
     if fill != "black" and parts[0] != "nominal":
-        parts[0] = f"{parts[0]}-{fill}"
+            parts[0] = f"{parts[0]}-{fill}"
+    if slots != "none":
+        parts.append(_SLOT_SLUGS.get(slots, _slugify(slots)))
+    
 
     return "_".join(p for p in parts if p and p != "nominal") or "nominal"
 
