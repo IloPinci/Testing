@@ -72,7 +72,7 @@ from scene_params import (
     IMG_RES, DEFAULT_CUBE_COLOR, CUBE_COLORS,
     CameraPerturbation, NOMINAL_PERTURBATION,
     ScenePerturbation, NOMINAL_SCENE,
-    CUBE_POSITIONS, SPHERE_PRESETS, BLACKOUT_MODES, BLANK_FILLS,
+    CUBE_POSITIONS, SPHERE_PRESETS, BLACKOUT_MODES, BLANK_FILLS, CAMERA_SLOT_SWAPS,
 )
 from episode_metrics import (
     EpisodeMonitor, MetricConfig, FAILURE_MODES, parse_index_spec, sphere_geometry,
@@ -379,7 +379,13 @@ def observe(training_cams: dict, perturbation: CameraPerturbation, blank_rng):
             images[key] = perturbation.blank_for((IMG_RES[1], IMG_RES[0], 3), blank_rng)
             status[role] = "blank"
         else:
-            images[key], status[role] = _render(training_cams[role], role == "wrist"), "ok"
+                        images[key], status[role] = _render(training_cams[role], role == "wrist"), "ok"
+    if perturbation.camera_slots != "none":
+        # Keys/roles below are INPUT SLOTS: slot `key` receives the (already
+        # perturbed) image of physical camera slot_source(key).
+        role_of = dict((k, r) for r, k in ROLES)
+        images = {key: images[perturbation.slot_source(key)] for _, key in ROLES}
+        status = {role: status[role_of[perturbation.slot_source(key)]] for role, key in ROLES}
     return images, status
 
 
@@ -717,6 +723,8 @@ def parse_args(argv=None):
     # camera perturbation
     p.add_argument("--blackout_mode", default="none", choices=sorted(BLACKOUT_MODES))
     p.add_argument("--blank_fill", default="black", choices=list(BLANK_FILLS))
+    p.add_argument("--camera_slots", default="none", choices=list(CAMERA_SLOT_SWAPS),
+                   help="Feed two cameras into each other's policy input slot (all views present).")
     p.add_argument("--pos_target", default=None, choices=[None, "context", "wrist", "top"])
     p.add_argument("--pos_offset", nargs=3, type=float, default=[0.0, 0.0, 0.0],
                    metavar=("DX", "DY", "DZ"),
@@ -746,7 +754,7 @@ def main(argv=None):
     perturbation = CameraPerturbation(
         blackout_mode=args.blackout_mode, position_target=args.pos_target,
         position_offset=tuple(args.pos_offset), tilt_target=args.tilt_target,
-        tilt_deg=args.tilt_deg, blank_fill=args.blank_fill,
+        tilt_deg=args.tilt_deg, blank_fill=args.blank_fill, camera_slots=args.camera_slots,
     )
     scene_perturbation = ScenePerturbation(
         cube_color=args.cube_color, cube_position_preset=args.cube_pos,
