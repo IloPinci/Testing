@@ -86,7 +86,7 @@ def slug_for(ze, args) -> str:
     cam = ze.CameraPerturbation(
         blackout_mode=args.blackout_mode, position_target=args.pos_target,
         position_offset=tuple(args.pos_offset), tilt_target=args.tilt_target,
-        tilt_deg=args.tilt_deg, blank_fill=args.blank_fill)
+        tilt_deg=args.tilt_deg, blank_fill=args.blank_fill, camera_slots=args.camera_slots)
     scn = ze.ScenePerturbation(
         cube_color=args.cube_color, cube_position_preset=args.cube_pos,
         spheres=ze.SPHERE_PRESETS[args.spheres])
@@ -101,8 +101,8 @@ def section_sweep(ze):
     check("B1 CORE/DOSE/CONTROLS arrays found", set(sets) == {"CORE", "DOSE", "CONTROLS"},
           f"found {sorted(sets)}")
     counts = {k: len(v) for k, v in sets.items()}
-    check("B2 condition counts (core 21, dose 19, controls 6)",
-          counts == {"CORE": 21, "DOSE": 19, "CONTROLS": 6}, str(counts))
+    check("B2 condition counts (core 26, dose 19, controls 6)",
+          counts == {"CORE": 26, "DOSE": 19, "CONTROLS": 6}, str(counts))
 
     common = ["--run_root", "static-check", "--checkpoint", "dummy", "--n", "200",
               "--matched_eval_set", "dummy.json", "--n_action_steps", "10"]
@@ -219,7 +219,7 @@ def section_stats():
           f"H0 rejection rate {p_null:.3f}, power {p_big:.3f} ({time.time() - t0:.1f}s)")
 
 
-# ── F. frozen thresholds and index parsing ───────────────────────────────────
+# F. frozen thresholds and index parsing 
 def section_metrics():
     import numpy as np
     import episode_metrics as em
@@ -239,6 +239,43 @@ def section_metrics():
           and p("3,17,40-42", 200) == [3, 17, 40, 41, 42])
     check("F3 parse_index_spec ('0-4', 'none', 'all', '3,17,40-42')", ok)
 
+
+# H. camera input-slot routing
+def section_routing(ze):
+    import numpy as np
+    from scene_params import CAMERA_SLOT_SWAPS
+    # One distinct constant image per PHYSICAL camera; _render is the only
+    # place observe() gets pixels from, so tagging it tags the source camera.
+    tag = {"context": 10, "wrist": 20, "top": 30}
+    real_render = ze._render
+    ze._render = lambda cam, is_wrist: np.full((4, 4, 3), tag[cam], np.uint8)
+    cams = {r: r for r in tag}
+    rng = np.random.default_rng(0)
+    try:
+        def seen(**kw):
+            imgs, st = ze.observe(cams, ze.CameraPerturbation(**kw), rng)
+            return ({k: (None if v is None else int(v[0, 0, 0])) for k, v in imgs.items()}, st)
+        ident, _ = seen()
+        check("H1 no swap: slot i receives physical camera i",
+              ident == {"camera1": 10, "camera2": 20, "camera3": 30}, str(ident))
+        expect = {"swap_wrist_top": {"camera1": 10, "camera2": 30, "camera3": 20},
+                  "swap_context_wrist": {"camera1": 20, "camera2": 10, "camera3": 30},
+                  "swap_context_top": {"camera1": 30, "camera2": 20, "camera3": 10}}
+        bad = [f"{m}: {seen(camera_slots=m)[0]}" for m, e in expect.items()
+               if seen(camera_slots=m)[0] != e]
+        check("H2 each swap exchanges exactly the two named slots",
+              not bad and set(expect) == set(CAMERA_SLOT_SWAPS) - {"none"}, "; ".join(bad))
+        imgs, st = seen(camera_slots="swap_wrist_top", blackout_mode="no_wrist")
+        check("H3 perturbation applies to the physical camera, then routing (blank wrist -> top slot)",
+              imgs["camera3"] == 0 and st["top"] == "blank" and imgs["camera2"] == 30
+              and st["wrist"] == "ok", f"{imgs} {st}")
+        try:
+            ze.CameraPerturbation(camera_slots="swap_wrist_top", blackout_mode="absent_top")
+            check("H4 swap + absent_* is refused", False, "accepted")
+        except ValueError:
+            check("H4 swap + absent_* is refused", True)
+    finally:
+        ze._render = real_render
 
 # G. real installed packages (subprocess, no stubs) 
 REAL_PROBE = r"""
@@ -304,7 +341,7 @@ def main():
     import stub_env
     stub_env.install_fake_genesis(); stub_env.install_fake_lerobot()
     import zeroshot_eval as ze
-    for sec in (lambda: section_sweep(ze), lambda: section_provenance(ze),
+    for sec in (lambda: section_sweep(ze), lambda: section_provenance(ze), lambda: section_routing(ze),
                 section_matched, section_stats, section_metrics):
         try:
             sec()
